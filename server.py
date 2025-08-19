@@ -1,14 +1,6 @@
 # server.py
 # Fantasy Live Draft API (JSON-driven + resilient + season-aware)
-# - Input: draft_json_url (Sleeper /draft/{id}/picks OR your hosted JSON export)
-# - Always revalidates before recommending (ETag/Last-Modified)
-# - Keeps a "last good" snapshot if a refresh blips
-# - Retries with backoff on external HTTP calls
-# - Warms players cache on startup; /warmup endpoint to preheat
-# - Season-aware (default 2025). Pass projections_url/adp_url for current season.
-# - Roster-aware via roster_id (draft slot 1..N)
-#
-# Security: set env var API_KEY on host; GPT sends header x-api-key: <same secret>
+# (… header comments unchanged …)
 
 import os, time, asyncio, random
 from typing import List, Dict, Optional, Set, Tuple, Any
@@ -46,7 +38,6 @@ async def robust_http_get(url: str, headers: Optional[Dict[str,str]]=None,
         try:
             async with httpx.AsyncClient(timeout=timeout) as client:
                 resp = await client.get(url, headers=headers)
-                # Treat non-2xx/304 as raise_for_status errors
                 if resp.status_code not in (200, 304):
                     resp.raise_for_status()
                 return resp
@@ -75,7 +66,7 @@ async def get_json_with_cache(url: str, force_revalidate: bool=True) -> Dict:
     if force_revalidate or data is None:
         code, new_data, new_etag, new_last = await http_get_json(url, etag, last_mod)
         if code == 304 and data is not None:
-            return data  # unchanged
+            return data
         JSON_CACHE[url] = {"etag": new_etag, "last_mod": new_last, "data": new_data, "ts": time.time()}
         return new_data
     return data
@@ -98,13 +89,9 @@ async def load_players_if_needed() -> None:
             }
         PLAYERS_LOADED_AT = time.time()
     except Exception:
-        # minimal fallback to avoid "empty"
         if not PLAYERS_CACHE:
-            PLAYERS_CACHE.update({
-                "999001":{"id":"999001","name":"Travis Etienne","pos":"RB","team":"JAX","bye":9,"adp":24,"proj_ros":245},
-                "999002":{"id":"999002","name":"DK Metcalf","pos":"WR","team":"SEA","bye":10,"adp":28,"proj_ros":230},
-                "999003":{"id":"999003","name":"Josh Allen","pos":"QB","team":"BUF","bye":13,"adp":20,"proj_ros":360}
-            })
+            # minimal fallback
+            PLAYERS_CACHE.update({})
             PLAYERS_LOADED_AT = time.time()
 
 # ===== PROJECTIONS / ADP MERGE =====
@@ -115,8 +102,7 @@ def merge_projection_fields(player: Dict, proj: Dict):
         if proj.get("adp") is not None: player["adp"] = proj["adp"]
 
 async def load_projections(season: int, projections_url: Optional[str]) -> None:
-    if not projections_url:
-        return
+    if not projections_url: return
     key = f"proj::{season}::{projections_url}"
     entry = PROJ_CACHE.get(key)
     if entry and (time.time() - entry["ts"]) < 3*3600:
@@ -130,8 +116,7 @@ async def load_projections(season: int, projections_url: Optional[str]) -> None:
         if p: merge_projection_fields(p, metrics)
 
 async def load_adp(season: int, adp_url: Optional[str]) -> None:
-    if not adp_url:
-        return
+    if not adp_url: return
     key = f"adp::{season}::{adp_url}"
     entry = ADP_CACHE.get(key)
     if entry and (time.time() - entry["ts"]) < 3*3600:
@@ -219,7 +204,6 @@ async def recommend_live(body: RecommendReq, x_api_key: Optional[str] = Header(N
     auth_or_401(x_api_key)
     await load_players_if_needed()
 
-    # Refresh draft JSON (with revalidation)
     drafted_ids: Set[str] = set()
     by_roster: Dict[int, Set[str]] = {}
     try:
@@ -228,7 +212,6 @@ async def recommend_live(body: RecommendReq, x_api_key: Optional[str] = Header(N
         if drafted_ids or by_roster:
             LAST_GOOD_DRAFT[body.draft_json_url] = {"data": draft_json, "ts": int(time.time())}
         else:
-            # If current fetch yielded nothing, try last-good snapshot
             lg = LAST_GOOD_DRAFT.get(body.draft_json_url)
             if lg:
                 draft_json = lg["data"]
@@ -243,14 +226,11 @@ async def recommend_live(body: RecommendReq, x_api_key: Optional[str] = Header(N
 
     my_ids = list(by_roster.get(int(body.roster_id), set())) if body.roster_id is not None else []
 
-    # Load season data (2025) if provided
     await load_projections(body.season, body.projections_url)
     await load_adp(body.season, body.adp_url)
 
-    # Roster template
     roster_slots = body.roster_slots or {"QB":1,"RB":2,"WR":2,"TE":1,"FLEX":2,"DST":1,"K":1}
 
-    # Available
     available_ids = [pid for pid in PLAYERS_CACHE if pid not in drafted_ids and pid not in my_ids]
     available = [PLAYERS_CACHE[pid] for pid in available_ids if PLAYERS_CACHE[pid].get("pos")]
 
@@ -265,24 +245,21 @@ async def recommend_live(body: RecommendReq, x_api_key: Optional[str] = Header(N
             "ts": int(time.time()),
             "debug": {
                 "players_cache": len(PLAYERS_CACHE),
-                "note": "Empty availability after filtering. Likely players cache warming or draft JSON empty. Using /warmup and retry."
+                "note": "Empty availability after filtering. Likely cache warming or draft JSON empty."
             }
         }
 
-    # Needs & caps
     needs = compute_needs(my_ids, roster_slots)
     pos_counts = {}
     for pid in my_ids:
         pos = PLAYERS_CACHE.get(pid,{}).get("pos")
         if pos: pos_counts[pos] = pos_counts.get(pos,0) + 1
 
-    # ADP median for tie-break
     adps = [p.get("adp") for p in available if isinstance(p.get("adp"), (int,float))]
     adp_median = None
     if adps:
         s = sorted(adps); adp_median = s[len(s)//2]
 
-    # Score
     scored = []
     for p in available:
         pos = p["pos"]
@@ -290,19 +267,16 @@ async def recommend_live(body: RecommendReq, x_api_key: Optional[str] = Header(N
         adp = p.get("adp")
         adp_discount = 0.0
         if adp_median is not None and isinstance(adp, (int,float)):
-            adp_discount = (adp_median - adp)  # earlier ADP (smaller) -> smaller discount
-
+            adp_discount = (adp_median - adp)
         need_boost = needs.get(pos, 1.0)
         cur = pos_counts.get(pos,0)
         cap = roster_sane_cap(pos, roster_slots)
         overdrafted = max(0, cur - cap)
         cap_penalty = 0.85 ** overdrafted
-
         score = proj
         score += 0.15 * adp_discount
         score *= (0.85 + 0.30 * need_boost)
         score *= cap_penalty
-
         scored.append({
             "id": p["id"], "name": p.get("name"), "team": p.get("team"),
             "pos": pos, "bye": p.get("bye"),
@@ -313,6 +287,14 @@ async def recommend_live(body: RecommendReq, x_api_key: Optional[str] = Header(N
         })
 
     ranked = sorted(scored, key=lambda x: x["score"], reverse=True)[:max(3, body.limit)]
+
+    # ==== FAIL-SAFE ====
+    if not ranked or len(ranked) < 3:
+        ranked = sorted(
+            [p for p in available if p.get("adp") is not None],
+            key=lambda x: x.get("adp", 9999)
+        )[:3]
+
     return {
         "pick": body.pick_number,
         "season_used": body.season,
