@@ -1,30 +1,42 @@
-# server.py — Live Sleeper draft (soft-stop) with relaxed player filter
-import os, time, asyncio, random, re, math
+# server.py — Live Sleeper draft + FantasyPros rankings.csv merge (no pandas)
+# - Accepts Sleeper web URL + team/roster_id
+# - Loads Sleeper players (filtered to QB/RB/WR/TE on real NFL teams)
+# - Merges local FantasyPros rankings.csv into scoring (ECR/ADP)
+# - Soft-stops (200 JSON) if live picks feed is empty/invalid (no hard failures)
+
+import os, time, asyncio, random, re, math, io, csv
 from typing import Any, Dict, List, Optional, Set, Tuple
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 import httpx
 
-API_KEY = os.getenv("API_KEY")   # optional in dev; if set, require x-api-key
+API_KEY = os.getenv("API_KEY")   # if set, require x-api-key header
 SLEEPER = "https://api.sleeper.app/v1"
 
-# Only draftable fantasy positions by default
-ALLOWED_POS = {"QB", "RB", "WR", "TE"}   # add "K","DST" later if you want
-
+# ===== POS/TEAM filters =====
+ALLOWED_POS = {"QB", "RB", "WR", "TE"}   # add "K","DST" later if desired
 NFL_TEAMS = {
     "ARI","ATL","BAL","BUF","CAR","CHI","CIN","CLE","DAL","DEN","DET","GB",
     "HOU","IND","JAX","KC","LAC","LAR","LV","MIA","MIN","NE","NO","NYG",
     "NYJ","PHI","PIT","SEA","SF","TB","TEN","WAS"
 }
 
-app = FastAPI(title="Fantasy Live Draft API (relaxed filter + soft-stop)")
+# ===== FantasyPros CSV path (local) =====
+RANKINGS_CSV_PATH = os.getenv("RANKINGS_CSV_PATH", "rankings.csv")
 
-# ===== Players cache =====
+app = FastAPI(title="Fantasy Live Draft API (FantasyPros CSV + soft-stop)")
+
+# ===== Caches =====
 PLAYERS_CACHE: Dict[str, Dict[str, Any]] = {}
 PLAYERS_LOADED_AT: float = 0.0
 PLAYERS_RAW_COUNT: int = 0
 PLAYERS_KEPT_COUNT: int = 0
 
+RANKINGS_MERGED_AT: float = 0.0
+RANKINGS_ROWS: int = 0
+RANKINGS_WARNINGS: List[str] = []
+
+# ===== Auth =====
 def auth_or_401(x_api_key: Optional[str]):
     if API_KEY and x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
@@ -57,31 +69,35 @@ async def _get_json(url: str) -> Any:
 _DRAFT_ID_RE = re.compile(r"(?P<id>\d{16,20})")
 
 def normalize_draft_picks_url(draft_url_or_page: str) -> Tuple[str, str]:
+    """
+    Accepts Sleeper web or API URL and returns (draft_id, api_picks_url).
+    Examples:
+      - https://sleeper.com/draft/nfl/{id}
+      - https://sleeper.app/draft/nfl/{id}
+      - https://api.sleeper.app/v1/draft/{id}/picks
+    """
     m = _DRAFT_ID_RE.search(draft_url_or_page)
     if not m:
         raise HTTPException(status_code=400, detail="Could not extract draft_id from provided URL.")
     draft_id = m.group("id")
     return draft_id, f"{SLEEPER}/draft/{draft_id}/picks"
 
-# ===== Players loading (RELAXED filter) =====
+# ===== Players (RELAXED filter; draftable only) =====
 def _valid_player(p: Dict[str, Any]) -> bool:
     pos = p.get("position")
     team = p.get("team")
-    if pos not in ALLOWED_POS:
-        return False
-    if not team or team not in NFL_TEAMS:
-        return False
+    if pos not in ALLOWED_POS: return False
+    if not team or team not in NFL_TEAMS: return False
     status = (p.get("status") or "").lower()
-    if status in {"retired"}:
-        return False
-    return True  # ← no ADP/projection requirement anymore
+    if status in {"retired"}: return False
+    return True
 
 async def load_players_if_needed() -> None:
     global PLAYERS_CACHE, PLAYERS_LOADED_AT, PLAYERS_RAW_COUNT, PLAYERS_KEPT_COUNT
-    if PLAYERS_CACHE and (time.time() - PLAYERS_LOADED_AT) < 3 * 3600:
+    if PLAYERS_CACHE and (time.time() - PLAYERS_LOADED_AT) < 3*3600:
         return
     data = await _get_json(f"{SLEEPER}/players/nfl")
-    PLAYERS_CACHE = {}
+    PLAYERS_CACHE.clear()
     PLAYERS_RAW_COUNT = len(data) if isinstance(data, dict) else 0
     kept = 0
     for pid, p in data.items():
@@ -95,19 +111,158 @@ async def load_players_if_needed() -> None:
             "team": p.get("team"),
             "pos": p.get("position"),
             "bye": p.get("bye_week"),
-            # Optional metrics (may be None in Sleeper)
-            "adp": p.get("adp"),
-            "proj_ros": p.get("fantasy_points_half_ppr"),
-            "proj_week": p.get("fantasy_points"),
+            # Optional metrics (often None from Sleeper)
+            "adp": _to_float(p.get("adp")),
+            "proj_ros": _to_float(p.get("fantasy_points_half_ppr")),
+            "proj_week": _to_float(p.get("fantasy_points")),
         }
         kept += 1
     PLAYERS_KEPT_COUNT = kept
     PLAYERS_LOADED_AT = time.time()
 
+# ===== Rankings CSV merge (FantasyPros) =====
+def _to_float(x) -> Optional[float]:
+    try:
+        if x is None or x == "": return None
+        return float(x)
+    except Exception:
+        return None
+
+def _to_int(x) -> Optional[int]:
+    try:
+        if x is None or x == "": return None
+        return int(float(x))
+    except Exception:
+        return None
+
+def _norm(s: str) -> str:
+    return re.sub(r"[^a-z]", "", (s or "").lower())
+
+def _name_key(name: str, team: Optional[str], pos: Optional[str]) -> str:
+    return f"{_norm(name)}|{(team or '').upper()}|{(pos or '').upper()}"
+
+def _row_get(row: Dict[str,str], *keys: str) -> Optional[str]:
+    for k in keys:
+        if k in row and row[k] != "":
+            return row[k]
+    return None
+
+def _parse_pos(row: Dict[str,str]) -> Optional[str]:
+    # FantasyPros often has "POS" or "Position", sometimes "Pos"
+    v = _row_get(row, "POS", "Pos", "Position", "position", "pos")
+    if v:
+        v = v.strip().upper()
+        # Normalize 'WR' 'RB' 'QB' 'TE' - sometimes comes like 'WR' or 'WR #18'
+        v = re.split(r"\s|#", v)[0]
+        if v in ALLOWED_POS:
+            return v
+    return None
+
+def _parse_team(row: Dict[str,str]) -> Optional[str]:
+    v = _row_get(row, "Team", "team", "NFL Team", "NFLTeam")
+    if v:
+        v = v.strip().upper()
+        # Some sheets use "JAC" vs "JAX", "LA" vs "LAR/LAC". We'll do a light alias map:
+        aliases = {"JAC":"JAX","WSH":"WAS","KAN":"KC","GNB":"GB","NOR":"NO","NWE":"NE","SFO":"SF","TAM":"TB","LVR":"LV"}
+        v = aliases.get(v, v)
+        if v in NFL_TEAMS:
+            return v
+    return None
+
+def _parse_name(row: Dict[str,str]) -> Optional[str]:
+    v = _row_get(row, "Player", "Name", "player", "name", "Full Name", "FullName")
+    if v:
+        # Remove trailing position/team suffix sometimes included: "Bijan Robinson (ATL - RB)"
+        v = re.sub(r"\s*\(.*?\)\s*$", "", v).strip()
+        return v
+    return None
+
+def _parse_ecr_rank(row: Dict[str,str]) -> Optional[int]:
+    # FantasyPros overall rank is often "Rank" or "ECR"
+    return _to_int(_row_get(row, "Rank", "ECR", "Overall", "Overall Rank"))
+
+def _parse_adp(row: Dict[str,str]) -> Optional[float]:
+    return _to_float(_row_get(row, "ADP", "ADP ", "Avg", "Average Draft Position"))
+
+def _parse_proj_points(row: Dict[str,str]) -> Optional[float]:
+    # If your csv has projected points column
+    return _to_float(_row_get(row, "Proj Pts", "Proj", "Points", "Projected Points", "FPts", "FPTS", "Fpts"))
+
+def _score_from_rank(rank: Optional[int]) -> Optional[float]:
+    # Turn a better (lower) rank into higher score. 400 is an arbitrary ceiling for overall depth.
+    if rank is None: return None
+    return max(0.0, 400.0 - float(rank))
+
+def _merge_into_player(p: Dict[str,Any], ecr_rank: Optional[int], adp: Optional[float], proj_pts: Optional[float]):
+    if adp is not None:
+        p["adp"] = adp
+    if proj_pts is not None:
+        p["proj_ros"] = proj_pts  # use ROS points if available
+    else:
+        # derive a coarse score from rank if we have no projections
+        derived = _score_from_rank(ecr_rank)
+        if derived is not None:
+            # keep existing proj_ros if it already exists and is larger
+            cur = _to_float(p.get("proj_ros"))
+            p["proj_ros"] = max(cur or 0.0, derived)
+
+def merge_rankings_csv(path: str) -> Tuple[int, List[str]]:
+    """
+    Reads FantasyPros rankings.csv from the repo folder.
+    Flexible header handling. Merges by (name, team, pos) key.
+    Returns (rows_merged, warnings)
+    """
+    warnings: List[str] = []
+    rows_merged = 0
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            rdr = csv.DictReader(f)
+            # Build an index of players by name-team-pos for quick match
+            index: Dict[str, Dict[str, Any]] = {}
+            for pid, p in PLAYERS_CACHE.items():
+                k = _name_key(p["name"], p.get("team"), p.get("pos"))
+                index[k] = p
+
+            for row in rdr:
+                name = _parse_name(row)
+                pos  = _parse_pos(row)
+                team = _parse_team(row)
+                if not name or not pos or not team:
+                    # try a looser key using just name+pos if team missing
+                    # but only for NFL teams, so skip if team clearly invalid
+                    continue
+                key = _name_key(name, team, pos)
+                target = index.get(key)
+                if not target:
+                    # If we don't find (name,team,pos), try name+pos only
+                    key2 = _name_key(name, None, pos)
+                    # Build a fallback scan (rare)
+                    target = None
+                    if key2:
+                        # scan PLAYERS_CACHE for same name+pos ignoring team (e.g., team alias mismatch)
+                        nm = _norm(name)
+                        for p in PLAYERS_CACHE.values():
+                            if _norm(p["name"]) == nm and p.get("pos") == pos:
+                                target = p
+                                break
+                if not target:
+                    continue
+
+                ecr = _parse_ecr_rank(row)
+                adp = _parse_adp(row)
+                proj = _parse_proj_points(row)
+                _merge_into_player(target, ecr, adp, proj)
+                rows_merged += 1
+    except FileNotFoundError:
+        warnings.append(f"{path} not found (skipping rankings merge).")
+    except Exception as e:
+        warnings.append(f"Error reading {path}: {e}")
+
+    return rows_merged, warnings
+
 # ===== Draft utils =====
 def parse_picks(picks_json: Any) -> List[Dict[str, Any]]:
-    if isinstance(picks_json, list):
-        return picks_json
+    if isinstance(picks_json, list): return picks_json
     if isinstance(picks_json, dict) and isinstance(picks_json.get("picks"), list):
         return picks_json["picks"]
     return []
@@ -182,7 +337,6 @@ def score_available(available: List[Dict[str, Any]],
         if pos:
             pos_counts[pos] = pos_counts.get(pos, 0) + 1
 
-    # ADP median tilt if present; OK if many are None
     adps = [p.get("adp") for p in available if isinstance(p.get("adp"), (int, float))]
     adp_median = sorted(adps)[len(adps)//2] if adps else None
 
@@ -213,7 +367,7 @@ def score_available(available: List[Dict[str, Any]],
     scored.sort(key=lambda x: x["score"], reverse=True)
     return scored
 
-# ===== Request model =====
+# ===== Models =====
 class RecommendReq(BaseModel):
     draft_url: str
     roster_id: int
@@ -226,6 +380,31 @@ class RecommendReq(BaseModel):
 @app.on_event("startup")
 async def startup():
     await load_players_if_needed()
+    _merge_local_rankings_if_present()
+
+def _merge_local_rankings_if_present():
+    """Try to merge FantasyPros rankings.csv if present locally."""
+    global RANKINGS_MERGED_AT, RANKINGS_ROWS, RANKINGS_WARNINGS
+    rows, warns = merge_rankings_csv(RANKINGS_CSV_PATH)
+    RANKINGS_ROWS = rows
+    RANKINGS_WARNINGS = warns
+    RANKINGS_MERGED_AT = time.time()
+
+@app.get("/warmup")
+def warmup():
+    """Force reload players and re-merge rankings.csv (for testing)."""
+    # Note: this is sync; safe enough for small loads on Render free dynos.
+    # For bigger loads, you could make this async and await load_players_if_needed().
+    # Reload players:
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(load_players_if_needed())
+    _merge_local_rankings_if_present()
+    return {
+        "ok": True,
+        "players_cached": len(PLAYERS_CACHE),
+        "rankings_rows": RANKINGS_ROWS,
+        "rankings_warnings": RANKINGS_WARNINGS
+    }
 
 @app.get("/health")
 def health():
@@ -234,10 +413,13 @@ def health():
         "players_cached": len(PLAYERS_CACHE),
         "players_raw": PLAYERS_RAW_COUNT,
         "players_kept": PLAYERS_KEPT_COUNT,
+        "rankings_rows": RANKINGS_ROWS,
+        "rankings_merged_at": int(RANKINGS_MERGED_AT) if RANKINGS_MERGED_AT else None,
+        "rankings_warnings": RANKINGS_WARNINGS,
         "ts": int(time.time())
     }
 
-# Helper (team number -> roster_id + roster snapshot)
+# ===== Helper: team number -> roster_id + roster snapshot =====
 @app.get("/draft/{draft_id}/team/{team_number}")
 async def team_debug(draft_id: str, team_number: int, x_api_key: Optional[str] = Header(None)):
     auth_or_401(x_api_key)
@@ -257,68 +439,10 @@ async def team_debug(draft_id: str, team_number: int, x_api_key: Optional[str] =
     state = await draft_state(draft_id, picks) if picks else {"note": "no picks yet"}
     return {"team_number": team_number, "roster_id": roster_id, "roster": roster, "state": state}
 
-# ===== Main recommender (soft-stop if feed empty) =====
+# ===== Main (soft-stop if live feed empty) =====
 @app.post("/recommend_live")
 async def recommend_live(body: RecommendReq, x_api_key: Optional[str] = Header(None)):
     auth_or_401(x_api_key)
     await load_players_if_needed()
-
-    draft_id, picks_url = normalize_draft_picks_url(body.draft_url)
-    picks_json = await _get_json(picks_url)
-    picks = parse_picks(picks_json)
-
-    if not picks:
-        return {
-            "status": "waiting_for_live_feed",
-            "message": "Live picks feed is empty/invalid. Not proceeding with recommendations.",
-            "draft_id": draft_id,
-            "picks_url": picks_url,
-            "recommended": [],
-            "alternatives": [],
-            "my_team": [],
-            "drafted_count": 0,
-            "my_team_count": 0,
-            "ts": int(time.time())
-        }
-
-    state = await draft_state(draft_id, picks)
-    drafted_ids, by_roster = parse_drafted_from_picks(picks)
-    my_ids = list(by_roster.get(body.roster_id, set()))
-
-    # Available pool (now large, because we relaxed filters)
-    available: List[Dict[str, Any]] = []
-    for pid, pdata in PLAYERS_CACHE.items():
-        if pid in drafted_ids: continue
-        if pid in my_ids: continue
-        available.append(pdata)
-
-    if not available:
-        return {
-            "status": "no_available_after_filtering",
-            "message": "No available players after filtering drafted and your roster.",
-            "draft_state": state,
-            "recommended": [],
-            "alternatives": [],
-            "my_team": [PLAYERS_CACHE[pid] for pid in my_ids if pid in PLAYERS_CACHE],
-            "drafted_count": len(drafted_ids),
-            "my_team_count": len(my_ids),
-            "ts": int(time.time())
-        }
-
-    slots = body.roster_slots or {"QB":1,"RB":2,"WR":2,"TE":1,"FLEX":2}
-    ranked = score_available(available, my_ids, slots, body.pick_number)
-    limit = max(3, body.limit)
-    topn = ranked[:limit]
-
-    return {
-        "status": "ok",
-        "pick": body.pick_number,
-        "season_used": body.season,
-        "recommended": topn[:3],
-        "alternatives": topn[3:limit],
-        "my_team": [PLAYERS_CACHE[pid] for pid in my_ids if pid in PLAYERS_CACHE],
-        "draft_state": state,
-        "drafted_count": len(drafted_ids),
-        "my_team_count": len(my_ids),
-        "ts": int(time.time())
-    }
+    # ensure local rankings were merged (in case startup merge failed or file was updated)
+    if (time.time() - RANKINGS_MER
