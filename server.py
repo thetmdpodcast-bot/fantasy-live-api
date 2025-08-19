@@ -1,306 +1,98 @@
-# server.py
-# Fantasy Live Draft API (JSON-driven + resilient + season-aware)
-# (… header comments unchanged …)
-
-import os, time, asyncio, random
-from typing import List, Dict, Optional, Set, Tuple, Any
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-import httpx
+import pandas as pd
+import requests
+import os
 
-API_KEY = os.getenv("API_KEY")  # optional in dev, recommended in prod
-SLEEPER = "https://api.sleeper.app/v1"
+app = FastAPI()
 
-app = FastAPI(title="Fantasy Live Draft API (JSON + Season + Resilience)")
+# ==============================
+# Load Rankings
+# ==============================
+RANKINGS_FILE = "rankings.csv"
 
-# ===== CACHES =====
-PLAYERS_CACHE: Dict[str, Dict] = {}
-PLAYERS_LOADED_AT: float = 0
+def load_rankings():
+    if not os.path.exists(RANKINGS_FILE):
+        raise FileNotFoundError("rankings.csv not found.")
+    df = pd.read_csv(RANKINGS_FILE)
+    # Ensure required columns exist
+    required_cols = {"player_name", "fantasy_points", "tds"}
+    if not required_cols.issubset(df.columns):
+        raise ValueError(f"rankings.csv missing required columns: {required_cols - set(df.columns)}")
+    return df
 
-JSON_CACHE: Dict[str, Dict[str, Any]] = {}      # url -> {"etag","last_mod","data","ts"}
-LAST_GOOD_DRAFT: Dict[str, Dict[str, Any]] = {}  # url -> {"data","ts"}
+rankings_df = load_rankings()
 
-PROJ_CACHE: Dict[str, Dict[str, Any]] = {}  # key -> {"data","ts"}
-ADP_CACHE:  Dict[str, Dict[str, Any]] = {}  # key -> {"data","ts"}
+# ==============================
+# Request Models
+# ==============================
+class RecommendRequest(BaseModel):
+    drafted_players: list[str] = []
 
-# ===== AUTH =====
-def auth_or_401(x_api_key: Optional[str]):
-    if not API_KEY:
-        return  # unsecured (dev)
-    if x_api_key != API_KEY:
-        raise HTTPException(status_code=401, detail="Invalid API key")
-
-# ===== HTTP HELPERS (robust) =====
-async def robust_http_get(url: str, headers: Optional[Dict[str,str]]=None,
-                          max_attempts: int=3, base: float=0.3, timeout: float=60.0) -> httpx.Response:
-    last_err = None
-    for i in range(max_attempts):
-        try:
-            async with httpx.AsyncClient(timeout=timeout) as client:
-                resp = await client.get(url, headers=headers)
-                if resp.status_code not in (200, 304):
-                    resp.raise_for_status()
-                return resp
-        except Exception as e:
-            last_err = e
-            await asyncio.sleep(base * (2**i) + random.random()*0.25)
-    raise HTTPException(status_code=502, detail=f"Upstream error fetching {url}: {last_err}")
-
-async def http_get_json(url: str, etag: Optional[str]=None, last_mod: Optional[str]=None
-                        ) -> Tuple[int, Dict, Optional[str], Optional[str]]:
-    headers = {}
-    if etag: headers["If-None-Match"] = etag
-    if last_mod: headers["If-Modified-Since"] = last_mod
-    resp = await robust_http_get(url, headers=headers, max_attempts=3, timeout=60.0)
-    if resp.status_code == 304:
-        return 304, {}, resp.headers.get("ETag"), resp.headers.get("Last-Modified")
-    try:
-        data = resp.json()
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Couldn't parse JSON at {url}: {e}")
-    return resp.status_code, data, resp.headers.get("ETag"), resp.headers.get("Last-Modified")
-
-async def get_json_with_cache(url: str, force_revalidate: bool=True) -> Dict:
-    entry = JSON_CACHE.get(url, {})
-    etag, last_mod, data = entry.get("etag"), entry.get("last_mod"), entry.get("data")
-    if force_revalidate or data is None:
-        code, new_data, new_etag, new_last = await http_get_json(url, etag, last_mod)
-        if code == 304 and data is not None:
-            return data
-        JSON_CACHE[url] = {"etag": new_etag, "last_mod": new_last, "data": new_data, "ts": time.time()}
-        return new_data
-    return data
-
-# ===== PLAYERS CACHE =====
-async def load_players_if_needed() -> None:
-    global PLAYERS_CACHE, PLAYERS_LOADED_AT
-    if PLAYERS_CACHE and (time.time() - PLAYERS_LOADED_AT) < 3*3600:
-        return
-    try:
-        resp = await robust_http_get(f"{SLEEPER}/players/nfl", timeout=90.0)
-        data = resp.json()
-        PLAYERS_CACHE = {}
-        for pid, p in data.items():
-            name = p.get("full_name") or f"{p.get('first_name','')} {p.get('last_name','')}".strip()
-            PLAYERS_CACHE[pid] = {
-                "id": pid, "name": name, "team": p.get("team"),
-                "pos": p.get("position"), "bye": p.get("bye_week"),
-                "adp": None, "proj_ros": None, "proj_week": None
-            }
-        PLAYERS_LOADED_AT = time.time()
-    except Exception:
-        if not PLAYERS_CACHE:
-            # minimal fallback
-            PLAYERS_CACHE.update({})
-            PLAYERS_LOADED_AT = time.time()
-
-# ===== PROJECTIONS / ADP MERGE =====
-def merge_projection_fields(player: Dict, proj: Dict):
-    if isinstance(proj, dict):
-        if proj.get("proj_ros") is not None: player["proj_ros"] = proj["proj_ros"]
-        if proj.get("proj_week") is not None: player["proj_week"] = proj["proj_week"]
-        if proj.get("adp") is not None: player["adp"] = proj["adp"]
-
-async def load_projections(season: int, projections_url: Optional[str]) -> None:
-    if not projections_url: return
-    key = f"proj::{season}::{projections_url}"
-    entry = PROJ_CACHE.get(key)
-    if entry and (time.time() - entry["ts"]) < 3*3600:
-        data = entry["data"]
-    else:
-        data = await get_json_with_cache(projections_url, force_revalidate=True)
-        PROJ_CACHE[key] = {"data": data, "ts": time.time()}
-    items = data.items() if isinstance(data, dict) else [(str(d.get("id")), d) for d in (data if isinstance(data, list) else [])]
-    for pid, metrics in items:
-        p = PLAYERS_CACHE.get(str(pid))
-        if p: merge_projection_fields(p, metrics)
-
-async def load_adp(season: int, adp_url: Optional[str]) -> None:
-    if not adp_url: return
-    key = f"adp::{season}::{adp_url}"
-    entry = ADP_CACHE.get(key)
-    if entry and (time.time() - entry["ts"]) < 3*3600:
-        data = entry["data"]
-    else:
-        data = await get_json_with_cache(adp_url, force_revalidate=True)
-        ADP_CACHE[key] = {"data": data, "ts": time.time()}
-    items = data.items() if isinstance(data, dict) else [(str(d.get("id")), d) for d in (data if isinstance(data, list) else [])]
-    for pid, metrics in items:
-        p = PLAYERS_CACHE.get(str(pid))
-        if p and isinstance(metrics, dict) and metrics.get("adp") is not None:
-            p["adp"] = metrics["adp"]
-
-# ===== DRAFT JSON PARSE =====
-def parse_drafted_from_sleeper_picks_json(draft_json: Any) -> Tuple[Set[str], Dict[int, Set[str]]]:
-    drafted: Set[str] = set()
-    by_roster: Dict[int, Set[str]] = {}
-    if isinstance(draft_json, list):
-        picks = draft_json
-    elif isinstance(draft_json, dict) and "picks" in draft_json:
-        picks = draft_json["picks"]
-    else:
-        picks = []
-    for p in picks:
-        pid = p.get("player_id")
-        rid = p.get("roster_id")
-        if pid:
-            drafted.add(str(pid))
-            if isinstance(rid, int):
-                by_roster.setdefault(rid, set()).add(str(pid))
-    return drafted, by_roster
-
-# ===== SCORING / NEEDS =====
-NEED_WEIGHTS = {"QB":1.1, "RB":1.45, "WR":1.45, "TE":1.25, "DST":0.5, "K":0.4}
-
-def roster_sane_cap(pos: str, roster_slots: Dict[str,int]) -> int:
-    if pos in {"RB","WR"}:
-        return roster_slots.get(pos,0) + roster_slots.get("FLEX",0) + 2
-    if pos in {"TE","QB"}:
-        return roster_slots.get(pos,0) + 1
-    return roster_slots.get(pos,0) + 1
-
-def compute_needs(my_ids: List[str], roster_slots: Dict[str,int]) -> Dict[str,float]:
-    counts = {"QB":0,"RB":0,"WR":0,"TE":0,"DST":0,"K":0}
-    for pid in my_ids:
-        pos = PLAYERS_CACHE.get(pid,{}).get("pos")
-        if pos in counts: counts[pos]+=1
-    needs = {}
-    for pos, base in NEED_WEIGHTS.items():
-        gap = max(0, roster_slots.get(pos,0) - counts.get(pos,0))
-        needs[pos] = base * (1.0 if gap>0 else 0.35)
-    return needs
-
-# ===== MODELS =====
-class RecommendReq(BaseModel):
-    draft_json_url: str
-    pick_number: int
-    season: int = 2025
-    roster_id: Optional[int] = None
-    roster_slots: Optional[Dict[str,int]] = None
-    projections_url: Optional[str] = None
-    adp_url: Optional[str] = None
-    limit: int = 10
-    refresh: bool = True
-
-# ===== LIFECYCLE & UTILS =====
-@app.on_event("startup")
-async def warm():
-    await load_players_if_needed()
-
-@app.get("/warmup")
-async def warmup():
-    await load_players_if_needed()
-    return {"ok": True, "players_cached": len(PLAYERS_CACHE)}
-
-@app.get("/health")
-def health(): return {"ok": True, "ts": int(time.time())}
-
-@app.get("/")
-def root(): return {"ok": True, "hint": "POST /recommend_live (see /docs)"}
-
-# ===== MAIN ENDPOINT =====
+# ==============================
+# Recommend Endpoint
+# ==============================
 @app.post("/recommend_live")
-async def recommend_live(body: RecommendReq, x_api_key: Optional[str] = Header(None)):
-    auth_or_401(x_api_key)
-    await load_players_if_needed()
-
-    drafted_ids: Set[str] = set()
-    by_roster: Dict[int, Set[str]] = {}
+def recommend_live(req: RecommendRequest):
     try:
-        draft_json = await get_json_with_cache(body.draft_json_url, force_revalidate=bool(body.refresh))
-        drafted_ids, by_roster = parse_drafted_from_sleeper_picks_json(draft_json)
-        if drafted_ids or by_roster:
-            LAST_GOOD_DRAFT[body.draft_json_url] = {"data": draft_json, "ts": int(time.time())}
-        else:
-            lg = LAST_GOOD_DRAFT.get(body.draft_json_url)
-            if lg:
-                draft_json = lg["data"]
-                drafted_ids, by_roster = parse_drafted_from_sleeper_picks_json(draft_json)
-    except Exception:
-        lg = LAST_GOOD_DRAFT.get(body.draft_json_url)
-        if lg:
-            draft_json = lg["data"]
-            drafted_ids, by_roster = parse_drafted_from_sleeper_picks_json(draft_json)
-        else:
-            raise
+        available = rankings_df[~rankings_df["player_name"].isin(req.drafted_players)]
+        if available.empty:
+            raise HTTPException(status_code=400, detail="No available players to recommend.")
 
-    my_ids = list(by_roster.get(int(body.roster_id), set())) if body.roster_id is not None else []
+        # Sort by combination of fantasy points + touchdowns
+        available["score"] = available["fantasy_points"] + available["tds"]
+        best = available.sort_values("score", ascending=False).head(3)
 
-    await load_projections(body.season, body.projections_url)
-    await load_adp(body.season, body.adp_url)
-
-    roster_slots = body.roster_slots or {"QB":1,"RB":2,"WR":2,"TE":1,"FLEX":2,"DST":1,"K":1}
-
-    available_ids = [pid for pid in PLAYERS_CACHE if pid not in drafted_ids and pid not in my_ids]
-    available = [PLAYERS_CACHE[pid] for pid in available_ids if PLAYERS_CACHE[pid].get("pos")]
-
-    if not available:
         return {
-            "pick": body.pick_number,
-            "season_used": body.season,
-            "recommended": [],
-            "alternatives": [],
-            "drafted_count": len(drafted_ids),
-            "my_team_count": len(my_ids),
-            "ts": int(time.time()),
-            "debug": {
-                "players_cache": len(PLAYERS_CACHE),
-                "note": "Empty availability after filtering. Likely cache warming or draft JSON empty."
-            }
+            "recommendations": best[["player_name", "fantasy_points", "tds"]].to_dict(orient="records")
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ==============================
+# Draft / Team Monitoring Endpoint
+# ==============================
+@app.get("/draft/{draft_id}/team/{team_number}")
+def get_team_roster(draft_id: str, team_number: int):
+    try:
+        # 1. Get draft metadata
+        draft_url = f"https://api.sleeper.app/v1/draft/{draft_id}"
+        draft_data = requests.get(draft_url).json()
+
+        # 2. Get draft picks
+        picks_url = f"https://api.sleeper.app/v1/draft/{draft_id}/picks"
+        picks_data = requests.get(picks_url).json()
+
+        # Fail safe: if picks_data is empty
+        if not picks_data:
+            raise HTTPException(status_code=500, detail="Unable to retrieve draft picks.")
+
+        # 3. Map team number to roster_id
+        roster_ids = sorted(set([p["roster_id"] for p in picks_data if "roster_id" in p]))
+        if team_number < 1 or team_number > len(roster_ids):
+            raise HTTPException(status_code=400, detail="Invalid team number")
+        roster_id = roster_ids[team_number - 1]
+
+        # 4. Build roster for this team
+        team_picks = [p for p in picks_data if p.get("roster_id") == roster_id]
+        roster = [
+            f"{p['metadata'].get('first_name', '')} {p['metadata'].get('last_name', '')}".strip()
+            for p in team_picks
+        ]
+
+        return {
+            "team_number": team_number,
+            "roster_id": roster_id,
+            "roster": roster,
+            "total_picks": len(team_picks)
         }
 
-    needs = compute_needs(my_ids, roster_slots)
-    pos_counts = {}
-    for pid in my_ids:
-        pos = PLAYERS_CACHE.get(pid,{}).get("pos")
-        if pos: pos_counts[pos] = pos_counts.get(pos,0) + 1
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-    adps = [p.get("adp") for p in available if isinstance(p.get("adp"), (int,float))]
-    adp_median = None
-    if adps:
-        s = sorted(adps); adp_median = s[len(s)//2]
-
-    scored = []
-    for p in available:
-        pos = p["pos"]
-        proj = float(p.get("proj_ros") or p.get("proj_week") or 0.0)
-        adp = p.get("adp")
-        adp_discount = 0.0
-        if adp_median is not None and isinstance(adp, (int,float)):
-            adp_discount = (adp_median - adp)
-        need_boost = needs.get(pos, 1.0)
-        cur = pos_counts.get(pos,0)
-        cap = roster_sane_cap(pos, roster_slots)
-        overdrafted = max(0, cur - cap)
-        cap_penalty = 0.85 ** overdrafted
-        score = proj
-        score += 0.15 * adp_discount
-        score *= (0.85 + 0.30 * need_boost)
-        score *= cap_penalty
-        scored.append({
-            "id": p["id"], "name": p.get("name"), "team": p.get("team"),
-            "pos": pos, "bye": p.get("bye"),
-            "proj_ros": p.get("proj_ros"), "proj_week": p.get("proj_week"),
-            "adp": p.get("adp"),
-            "score": round(score,3),
-            "explain": f"{pos} need {need_boost:.2f}, cap {cur}/{cap}, season {body.season}"
-        })
-
-    ranked = sorted(scored, key=lambda x: x["score"], reverse=True)[:max(3, body.limit)]
-
-    # ==== FAIL-SAFE ====
-    if not ranked or len(ranked) < 3:
-        ranked = sorted(
-            [p for p in available if p.get("adp") is not None],
-            key=lambda x: x.get("adp", 9999)
-        )[:3]
-
-    return {
-        "pick": body.pick_number,
-        "season_used": body.season,
-        "recommended": ranked[:3],
-        "alternatives": ranked[3:body.limit],
-        "drafted_count": len(drafted_ids),
-        "my_team_count": len(my_ids),
-        "ts": int(time.time())
-    }
+# ==============================
+# Health Check
+# ==============================
+@app.get("/")
+def root():
+    return {"status": "Fantasy Live API is running!"}
