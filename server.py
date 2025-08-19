@@ -1,4 +1,4 @@
-# server.py — Live Sleeper draft (normalize URL, soft-stop if feed empty), no CSV/pandas
+# server.py — Live Sleeper draft (soft-stop if feed empty), filtered player pool (QB/RB/WR/TE only), no CSV/pandas
 import os, time, asyncio, random, re, math
 from typing import Any, Dict, List, Optional, Set, Tuple
 from fastapi import FastAPI, Header, HTTPException
@@ -8,7 +8,16 @@ import httpx
 API_KEY = os.getenv("API_KEY")   # optional in dev; if set, require x-api-key header
 SLEEPER = "https://api.sleeper.app/v1"
 
-app = FastAPI(title="Fantasy Live Draft API (soft-stop; no CSV)")
+# Only keep draftable fantasy positions by default
+ALLOWED_POS = {"QB", "RB", "WR", "TE"}   # add "K","DST" if you want them considered
+
+NFL_TEAMS = {
+    "ARI","ATL","BAL","BUF","CAR","CHI","CIN","CLE","DAL","DEN","DET","GB",
+    "HOU","IND","JAX","KC","LAC","LAR","LV","MIA","MIN","NE","NO","NYG",
+    "NYJ","PHI","PIT","SEA","SF","TB","TEN","WAS"
+}
+
+app = FastAPI(title="Fantasy Live Draft API (filtered + soft-stop; no CSV)")
 
 # ===== Players cache =====
 PLAYERS_CACHE: Dict[str, Dict[str, Any]] = {}
@@ -59,15 +68,40 @@ def normalize_draft_picks_url(draft_url_or_page: str) -> Tuple[str, str]:
     draft_id = m.group("id")
     return draft_id, f"{SLEEPER}/draft/{draft_id}/picks"
 
-# ===== Players loading =====
+# ===== Players loading (FILTERED) =====
+def _valid_player(p: Dict[str, Any]) -> bool:
+    pos = p.get("position")
+    team = p.get("team")
+    # must be a fantasy position we care about and on a real NFL team
+    if pos not in ALLOWED_POS: 
+        return False
+    if not team or team not in NFL_TEAMS:
+        return False
+    # must have at least SOME signal to rank on (proj or adp)
+    has_signal = (p.get("adp") is not None) or (p.get("fantasy_points_half_ppr") is not None) or (p.get("fantasy_points") is not None)
+    if not has_signal:
+        return False
+    # (optional) exclude IR/Out/free agents: Sleeper uses status fields inconsistently; keep loose:
+    status = (p.get("status") or "").lower()
+    if status in {"injured_reserve", "retired", "out"}:
+        return False
+    return True
+
 async def load_players_if_needed() -> None:
     global PLAYERS_CACHE, PLAYERS_LOADED_AT
     if PLAYERS_CACHE and (time.time() - PLAYERS_LOADED_AT) < 3 * 3600:
         return
     data = await _get_json(f"{SLEEPER}/players/nfl")
     PLAYERS_CACHE = {}
+    kept = 0
     for pid, p in data.items():
-        name = p.get("full_name") or f"{p.get('first_name','').strip()} {p.get('last_name','').strip()}".strip() or pid
+        if not isinstance(p, dict):
+            continue
+        if not _valid_player(p):
+            continue
+        name = p.get("full_name") or f"{p.get('first_name','').strip()} {p.get('last_name','').strip()}".strip()
+        if not name:
+            continue
         PLAYERS_CACHE[pid] = {
             "id": pid,
             "name": name,
@@ -79,7 +113,9 @@ async def load_players_if_needed() -> None:
             "proj_ros": p.get("fantasy_points_half_ppr"),
             "proj_week": p.get("fantasy_points"),
         }
+        kept += 1
     PLAYERS_LOADED_AT = time.time()
+    # print(len(data), "raw; kept", kept)  # optional debug
 
 # ===== Draft utils =====
 def parse_picks(picks_json: Any) -> List[Dict[str, Any]]:
@@ -127,7 +163,7 @@ async def draft_state(draft_id: str, picks: List[Dict[str, Any]]) -> Dict[str, A
     }
 
 # ===== Scoring =====
-NEED_WEIGHTS = {"QB":1.1, "RB":1.45, "WR":1.45, "TE":1.25, "DST":0.5, "K":0.4}
+NEED_WEIGHTS = {"QB":1.1, "RB":1.45, "WR":1.45, "TE":1.25}  # if you enable K/DST, add them here too
 
 def roster_cap(pos: str, slots: Dict[str, int]) -> int:
     if pos in {"RB","WR"}:
@@ -137,7 +173,7 @@ def roster_cap(pos: str, slots: Dict[str, int]) -> int:
     return slots.get(pos, 0) + 1
 
 def compute_needs(my_ids: List[str], slots: Dict[str, int]) -> Dict[str, float]:
-    counts = {"QB":0,"RB":0,"WR":0,"TE":0,"DST":0,"K":0}
+    counts = {k:0 for k in NEED_WEIGHTS.keys()}
     for pid in my_ids:
         pos = PLAYERS_CACHE.get(pid, {}).get("pos")
         if pos in counts:
@@ -158,6 +194,7 @@ def score_available(available: List[Dict[str, Any]],
         pos = PLAYERS_CACHE.get(pid, {}).get("pos")
         if pos:
             pos_counts[pos] = pos_counts.get(pos, 0) + 1
+
     adps = [p.get("adp") for p in available if isinstance(p.get("adp"), (int, float))]
     adp_median = sorted(adps)[len(adps)//2] if adps else None
 
@@ -255,12 +292,13 @@ async def recommend_live(body: RecommendReq, x_api_key: Optional[str] = Header(N
     drafted_ids, by_roster = parse_drafted_from_picks(picks)
     my_ids = list(by_roster.get(body.roster_id, set()))
 
-    # Available pool
+    # Available pool (already filtered to fantasy positions/teams/signals at load time)
     available: List[Dict[str, Any]] = []
     for pid, pdata in PLAYERS_CACHE.items():
-        if not pdata.get("pos"): continue
-        if pid in drafted_ids: continue
-        if pid in my_ids: continue
+        if pid in drafted_ids: 
+            continue
+        if pid in my_ids: 
+            continue
         available.append(pdata)
 
     if not available:
@@ -276,7 +314,7 @@ async def recommend_live(body: RecommendReq, x_api_key: Optional[str] = Header(N
             "ts": int(time.time())
         }
 
-    slots = body.roster_slots or {"QB":1,"RB":2,"WR":2,"TE":1,"FLEX":2,"DST":1,"K":1}
+    slots = body.roster_slots or {"QB":1,"RB":2,"WR":2,"TE":1,"FLEX":2}  # adjust if you draft K/DST
     ranked = score_available(available, my_ids, slots, body.pick_number)
     limit = max(3, body.limit)
     topn = ranked[:limit]
