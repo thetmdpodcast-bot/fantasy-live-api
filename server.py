@@ -445,4 +445,5 @@ async def recommend_live(body: RecommendReq, x_api_key: Optional[str] = Header(N
     auth_or_401(x_api_key)
     await load_players_if_needed()
     # ensure local rankings were merged (in case startup merge failed or file was updated)
-    if (time.time() - RANKINGS_MER
+    if (time.time() - RANKINGS_MERGE_LAST) > 300:
+
