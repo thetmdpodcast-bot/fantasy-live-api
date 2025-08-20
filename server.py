@@ -1,7 +1,7 @@
-# server.py — Sleeper live draft -> name-join to rankings.csv ("avg") + roster-aware ranking
+# server.py — Sleeper live draft → name-join to rankings.csv ("AVG") + roster-aware ranking
 # - Input: Sleeper draft URL + roster_id + pick_number
 # - Pulls live picks, builds UNDRAFTED pool, name-joins to local rankings.csv
-# - Uses rankings `avg` as primary signal (also mapped to adp), blends roster needs
+# - Uses rankings `AVG`/`avg` as primary signal (also mapped to adp), blends roster needs
 # - Soft responses for 404/empty feeds
 # - No pandas dependency
 
@@ -11,11 +11,11 @@ from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 import httpx
 
-API_KEY = os.getenv("API_KEY")                         # if set, require x-api-key
+API_KEY = os.getenv("API_KEY")  # if set, require x-api-key header
 SLEEPER = "https://api.sleeper.app/v1"
 RANKINGS_CSV_PATH = os.getenv("RANKINGS_CSV_PATH", "rankings.csv")
 
-ALLOWED_POS = {"QB","RB","WR","TE"}                   # add "K","DST" later if needed
+ALLOWED_POS = {"QB","RB","WR","TE"}
 NFL_TEAMS = {
     "ARI","ATL","BAL","BUF","CAR","CHI","CIN","CLE","DAL","DEN","DET","GB",
     "HOU","IND","JAX","KC","LAC","LAR","LV","MIA","MIN","NE","NO","NYG",
@@ -30,7 +30,7 @@ PLAYERS_LOADED_AT: float = 0.0
 PLAYERS_RAW_COUNT: int = 0
 PLAYERS_KEPT_COUNT: int = 0
 
-RANK_IDX: Dict[str, List[Dict[str, Any]]] = {}        # name_key -> list of {name,pos,team,avg,adp,proj}
+RANK_IDX: Dict[str, List[Dict[str, Any]]] = {}  # name_key -> list of {name,pos,team,avg,adp,proj}
 RANKINGS_ROWS: int = 0
 RANKINGS_WARNINGS: List[str] = []
 RANKINGS_LAST_MERGE_TS: float = 0.0
@@ -73,14 +73,27 @@ def normalize_draft_picks_url(draft_url_or_page: str) -> Tuple[str,str]:
     draft_id = m.group("id")
     return draft_id, f"{SLEEPER}/draft/{draft_id}/picks"
 
-# -------------------- small utils --------------------
+# -------------------- utils --------------------
 _SUFFIXES = {"jr","sr","ii","iii","iv","v"}
 _KEEP_INITIALS = {"dk","aj","cj","bj","pj","tj","kj","jj","dj","mj","rj"}
 def norm_name(name: str) -> str:
-    s = name.lower()
-    s = re.sub(r"[.\'\-]", " ", s)
+    """
+    Normalize names from both Sleeper and rankings.csv so they match:
+    - lower-case
+    - remove punctuation (.,'-)
+    - handle "Last, First" → "First Last"
+    - strip suffixes (Jr, III, etc.)
+    - join without spaces to a stable key
+    """
+    s = name.lower().strip()
+    # If there is a comma, treat as "Last, First"
+    if "," in s:
+        parts = [p.strip() for p in s.split(",")]
+        if len(parts) == 2 and parts[0] and parts[1]:
+            s = f"{parts[1]} {parts[0]}"
+    s = re.sub(r"[.\'\-,]", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
-    parts = [p for p in s.split(" ") if p]
+    parts = s.split(" ")
     if parts and parts[-1] in _SUFFIXES:
         parts = parts[:-1]
     clean = [p for p in parts if len(p) > 1 or p in _KEEP_INITIALS]
@@ -121,8 +134,8 @@ async def load_players_if_needed() -> None:
             "team": p.get("team"),
             "pos": p.get("position"),
             "bye": p.get("bye_week"),
-            "adp": _to_float(p.get("adp")),      # may be None, we’ll fill from rankings avg
-            "proj_ros": None,                    # derived from avg or csv projection
+            "adp": _to_float(p.get("adp")),      # may be None, we’ll fill from rankings AVG
+            "proj_ros": None,                    # derived from AVG or csv projection
             "rank_avg": None
         }
         kept += 1
@@ -137,16 +150,21 @@ def _row_get(row: Dict[str,str], *keys: str) -> Optional[str]:
     return None
 
 def _parse_name(row: Dict[str,str]) -> Optional[str]:
+    # Your file uses "Player" (capital P). Keep fallbacks too.
     v = _row_get(row, "Player","Name","player","name","Full Name","FullName")
     if v: return re.sub(r"\s*\(.*?\)\s*$","",v).strip()
     return None
 
 def _parse_pos(row: Dict[str,str]) -> Optional[str]:
+    # Your file shows POS like WR1, RB2. Extract the leading letters only.
     v = _row_get(row, "POS","Pos","Position","position","pos")
     if v:
         v = v.strip().upper()
-        v = re.split(r"\s|#", v)[0]
-        if v in ALLOWED_POS: return v
+        m = re.match(r"[A-Z]+", v)  # take only the alpha prefix
+        if m:
+            v = m.group(0)
+            if v in ALLOWED_POS:
+                return v
     return None
 
 def _parse_team(row: Dict[str,str]) -> Optional[str]:
@@ -159,7 +177,8 @@ def _parse_team(row: Dict[str,str]) -> Optional[str]:
     return None
 
 def _parse_avg(row: Dict[str,str]) -> Optional[float]:
-    return _to_float(_row_get(row, "avg","Avg","AVG","Average"))
+    # Your file uses "AVG" (uppercase). Keep flexible matching too.
+    return _to_float(_row_get(row, "AVG","avg","Avg","Average"))
 
 def _parse_adp(row: Dict[str,str]) -> Optional[float]:
     return _to_float(_row_get(row, "ADP","Adp","adp","Average Draft Position"))
@@ -203,7 +222,7 @@ def ensure_rankings_loaded(force: bool=False) -> None:
         RANKINGS_WARNINGS = warns
         RANKINGS_LAST_MERGE_TS = time.time()
 
-# -------------------- picks parsing --------------------
+# -------------------- draft helpers --------------------
 def parse_picks(picks_json: Any) -> List[Dict[str, Any]]:
     if isinstance(picks_json, list): return picks_json
     if isinstance(picks_json, dict) and isinstance(picks_json.get("picks"), list):
@@ -247,16 +266,8 @@ async def draft_state(draft_id: str, picks: List[Dict[str, Any]]) -> Dict[str, A
         "roster_id_on_clock": roster_on_clock
     }
 
-# -------------------- helper you asked for --------------------
+# -------------------- helper: join undrafted with rankings --------------------
 def match_players_with_rankings(undrafted_pids: List[str]) -> List[Dict[str, Any]]:
-    """
-    Given a list of undrafted player IDs (from PLAYERS_CACHE),
-    join each to rankings.csv by normalized name. If a match is found:
-      - set p['rank_avg'] from csv 'avg'
-      - set p['adp'] = avg (aligning with your request)
-      - set p['proj_ros'] from csv 'proj' if present; otherwise derive from avg (400 - avg)
-    Returns a list of enriched player dicts ready for scoring.
-    """
     result = []
     for pid in undrafted_pids:
         p = PLAYERS_CACHE.get(pid)
@@ -275,7 +286,7 @@ def match_players_with_rankings(undrafted_pids: List[str]) -> List[Dict[str, Any
             proj = chosen.get("proj")
             if avg is not None:
                 p["rank_avg"] = avg
-                p["adp"] = avg
+                p["adp"] = avg                         # align AVG to ADP field
                 p["proj_ros"] = max(float(p.get("proj_ros") or 0.0), max(0.0, 400.0 - float(avg)))
             if proj is not None:
                 p["proj_ros"] = proj
@@ -421,7 +432,7 @@ async def recommend_live(body: RecommendReq, x_api_key: Optional[str] = Header(N
         if pid not in drafted_ids and pid not in my_ids
     ]
 
-    # ------ Helper in action: enrich UNDRAFTED with rankings.csv ------
+    # Enrich with rankings.csv (AVG → adp/rank_avg; proj if available)
     available_enriched = match_players_with_rankings(undrafted_pids)
 
     if not available_enriched:
