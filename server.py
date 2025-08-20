@@ -1,9 +1,6 @@
 # server.py — Sleeper live draft → rankings.csv ("AVG") name-join + roster-aware scoring
 # Robustly maps user-provided team slot or roster_id to the correct roster_id.
-# Adds /guess_roster to infer roster_id from already-drafted player names.
-# Enhancements:
-#  - /guess_roster works with or without player_names.
-#  - roster_id<=0 in /inspect_draft and /recommend_live triggers auto-detection.
+# Adds /guess_roster with rankings-aware name matching (exact + fuzzy).
 
 import os
 import time
@@ -18,7 +15,7 @@ from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 import httpx
 
-API_KEY = os.getenv("API_KEY")  # if set, require x-api-key header
+API_KEY = os.getenv("API_KEY")  # if set, require x-api-key header on all endpoints
 SLEEPER = "https://api.sleeper.app/v1"
 RANKINGS_CSV_PATH = os.getenv("RANKINGS_CSV_PATH", "rankings.csv")
 
@@ -29,7 +26,7 @@ NFL_TEAMS = {
     "NYJ","PHI","PIT","SEA","SF","TB","TEN","WAS"
 }
 
-app = FastAPI(title="Fantasy Live Draft (rankings.csv name-join)")
+app = FastAPI(title="Fantasy Live Draft (rankings + live)")
 
 # -------------------- caches --------------------
 PLAYERS_CACHE: Dict[str, Dict[str, Any]] = {}
@@ -37,7 +34,11 @@ PLAYERS_LOADED_AT: float = 0.0
 PLAYERS_RAW_COUNT: int = 0
 PLAYERS_KEPT_COUNT: int = 0
 
-RANK_IDX: Dict[str, List[Dict[str, Any]]] = {}  # name_key -> list of {name,pos,team,avg,adp,proj}
+# Rankings indexes
+# - RANK_IDX: normalized name -> list of rows {name,pos,team,avg,adp,proj}
+# - RANK_ALL_KEYS: normalized name -> canonical name (for quick existence tests / expansion)
+RANK_IDX: Dict[str, List[Dict[str, Any]]] = {}
+RANK_ALL_KEYS: Dict[str, str] = {}
 RANKINGS_ROWS: int = 0
 RANKINGS_WARNINGS: List[str] = []
 RANKINGS_LAST_MERGE_TS: float = 0.0
@@ -84,12 +85,15 @@ _SUFFIXES = {"jr","sr","ii","iii","iv","v"}
 _KEEP_INITIALS = {"dk","aj","cj","bj","pj","tj","kj","jj","dj","mj","rj"}
 
 def norm_name(name: str) -> str:
-    s = name.lower().strip()
+    """Canonical key for player names (handles apostrophes, hyphens, suffixes, commas, 'St.')"""
+    s = (name or "").lower().strip()
+    # "last, first" → "first last"
     if "," in s:
         parts = [p.strip() for p in s.split(",")]
         if len(parts) == 2 and parts[0] and parts[1]:
             s = f"{parts[1]} {parts[0]}"
-    s = re.sub(r"[.\'\-,]", " ", s)
+    s = re.sub(r"\bst\.?\b", "st", s)          # "St. Brown" → "st brown"
+    s = re.sub(r"[.\'\-,]", " ", s)            # punctuation to space
     s = re.sub(r"\s+", " ", s).strip()
     parts = s.split()
     if parts and parts[-1] in _SUFFIXES:
@@ -152,7 +156,7 @@ def _parse_name(row: Dict[str,str]) -> Optional[str]:
     return None
 
 def _parse_pos(row: Dict[str,str]) -> Optional[str]:
-    v = _row_get(row, "POS","Pos","Position","position","pos")
+    v = _row_get(row, "POS","Pos","POS","Position","position","pos")
     if v:
         v = v.strip().upper()
         m = re.match(r"[A-Z]+", v)
@@ -179,9 +183,11 @@ def _parse_adp(row: Dict[str,str]) -> Optional[float]:
 def _parse_proj(row: Dict[str,str]) -> Optional[float]:
     return _to_float(_row_get(row, "Proj Pts","Proj","FPts","FPTS","Projected Points","Points"))
 
-def build_rank_index(path: str) -> Tuple[int, List[str], Dict[str, List[Dict[str,Any]]]]:
+def build_rank_index(path: str) -> Tuple[int, List[str], Dict[str, List[Dict[str,Any]]], Dict[str,str]]:
+    """Return: (rows_count, warnings, name_key→rows, name_key→canonical name)"""
     warnings: List[str] = []
     idx: Dict[str, List[Dict[str,Any]]] = {}
+    key_to_canonical: Dict[str, str] = {}
     rows = 0
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -199,21 +205,41 @@ def build_rank_index(path: str) -> Tuple[int, List[str], Dict[str, List[Dict[str
                     "proj": _parse_proj(row)
                 }
                 idx.setdefault(key, []).append(ent)
+                # prefer first seen as canonical
+                key_to_canonical.setdefault(key, name)
                 rows += 1
     except FileNotFoundError:
         warnings.append(f"{path} not found (skipping rankings).")
     except Exception as e:
         warnings.append(f"Error reading {path}: {e}")
-    return rows, warnings, idx
+    return rows, warnings, idx, key_to_canonical
 
 def ensure_rankings_loaded(force: bool=False) -> None:
-    global RANK_IDX, RANKINGS_ROWS, RANKINGS_WARNINGS, RANKINGS_LAST_MERGE_TS
+    global RANK_IDX, RANK_ALL_KEYS, RANKINGS_ROWS, RANKINGS_WARNINGS, RANKINGS_LAST_MERGE_TS
     if force or RANKINGS_LAST_MERGE_TS == 0.0:
-        rows, warns, idx = build_rank_index(RANKINGS_CSV_PATH)
+        rows, warns, idx, k2c = build_rank_index(RANKINGS_CSV_PATH)
         RANK_IDX = idx
+        RANK_ALL_KEYS = k2c
         RANKINGS_ROWS = rows
         RANKINGS_WARNINGS = warns
         RANKINGS_LAST_MERGE_TS = time.time()
+
+def expand_to_rank_keys(input_name: str) -> Set[str]:
+    """
+    Turn an arbitrary input into a set of normalized keys:
+    - exact normalized name
+    - plus fuzzy matches where either key contains the other
+    """
+    out: Set[str] = set()
+    key = norm_name(input_name)
+    if key:
+        out.add(key)
+    if not key or key not in RANK_ALL_KEYS:
+        # fuzzy expansion
+        for k in RANK_ALL_KEYS.keys():
+            if key and (key in k or k in key):
+                out.add(k)
+    return out
 
 # -------------------- draft helpers --------------------
 def parse_picks(picks_json: Any) -> List[Dict[str, Any]]:
@@ -262,6 +288,7 @@ def normalize_slot_to_roster(slot_to_roster_raw: Any, total_teams: int) -> List[
     return result
 
 def map_slot_or_roster_id(input_id: int, slot_to_roster: Any, by_roster: Dict[int, Set[str]], total_teams: int) -> Tuple[int, Optional[int]]:
+    """Accept team slot OR roster_id and return (effective_roster_id, effective_team_slot_or_None)."""
     if input_id in by_roster:
         return input_id, None
 
@@ -417,7 +444,7 @@ def score_available(available: List[Dict[str,Any]], my_ids: List[str], slots: Di
 # -------------------- request models --------------------
 class RecommendReq(BaseModel):
     draft_url: str
-    roster_id: int          # may be a real roster_id OR the team slot number (1..N); <=0 means auto-detect
+    roster_id: int          # may be a real roster_id OR the team slot number (1..N)
     pick_number: int
     season: int = 2025
     roster_slots: Optional[Dict[str,int]] = None
@@ -425,12 +452,11 @@ class RecommendReq(BaseModel):
 
 class InspectReq(BaseModel):
     draft_url: str
-    roster_id: int          # may be a real roster_id OR the team slot number; <=0 means auto-detect
+    roster_id: int          # may be a real roster_id OR the team slot number
 
 class GuessRosterReq(BaseModel):
     draft_url: str
-    # Optional: if omitted/empty, we'll infer from all drafted players
-    player_names: Optional[List[str]] = None
+    player_names: List[str]   # e.g., ["Saquon Barkley","Amon-Ra St. Brown"]
 
 # -------------------- lifecycle --------------------
 @app.on_event("startup")
@@ -481,75 +507,60 @@ def _pick_fullname_key(pick: Dict[str,Any]) -> Optional[str]:
 # -------------------- endpoints --------------------
 @app.post("/guess_roster")
 async def guess_roster(body: GuessRosterReq, x_api_key: Optional[str] = Header(None)):
+    """
+    Given player_names already drafted by the user, infer which roster_id they are.
+    Enhanced matching:
+      - exact normalized name matches
+      - fuzzy expansion using rankings.csv (key contains other)
+    """
     auth_or_401(x_api_key)
     await load_players_if_needed()
+    ensure_rankings_loaded()
 
     draft_id, picks_url = normalize_draft_picks_url(body.draft_url)
     picks_json = await _get_json(picks_url)
     picks = parse_picks(picks_json)
 
-    # If names were provided, score rosters by matches against those names.
-    targets = {norm_name(n) for n in (body.player_names or []) if isinstance(n, str) and n.strip()}
+    # Expand inputs to the set of acceptable normalized keys.
+    targets: Set[str] = set()
+    for nm in body.player_names:
+        targets |= expand_to_rank_keys(nm)
+    # In case rankings are missing, also include the raw normalized input.
+    for nm in body.player_names:
+        key = norm_name(nm)
+        if key:
+            targets.add(key)
+
+    if not targets:
+        raise HTTPException(status_code=400, detail="Provide at least one player name in player_names.")
 
     scores: Dict[int,int] = {}
     hits: Dict[int,List[str]] = {}
-    drafted_by_roster: Dict[int,List[str]] = {}
-
     for p in picks:
         rid = p.get("roster_id")
-        if not isinstance(rid, int):
-            continue
+        if not isinstance(rid, int): continue
         key = _pick_fullname_key(p)
-        # keep readable drafted list regardless (for UI/preview)
-        md = p.get("metadata") or {}
-        pretty = f"{md.get('first_name','').strip()} {md.get('last_name','').strip()}".strip() or (key or "")
-        if pretty:
-            drafted_by_roster.setdefault(rid, []).append(pretty)
-
-        if not targets or (key and key in targets):
-            # If no targets: count all drafted players to find the fullest roster
-            # If targets: count only matches
+        if not key: continue
+        if key in targets:
             scores[rid] = scores.get(rid, 0) + 1
-            if targets:
-                hits.setdefault(rid, []).append(pretty)
+            md = p.get("metadata") or {}
+            pretty = f"{md.get('first_name','').strip()} {md.get('last_name','').strip()}".strip() or key
+            hits.setdefault(rid, []).append(pretty)
 
     ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
     best = ranked[0][0] if ranked else None
 
-    # Build a compact preview for each roster (first 10 names)
-    preview = [
-        {
-            "roster_id": rid,
-            "count": len(drafted_by_roster.get(rid, [])),
-            "players": drafted_by_roster.get(rid, [])[:10]
-        }
-        for rid in sorted(drafted_by_roster.keys())
-    ]
+    roster_preview: List[str] = hits.get(best, []) if best is not None else []
 
     return {
         "status": "ok",
         "draft_id": draft_id,
-        "candidates": [{"roster_id": rid, "matches": cnt, "players": hits.get(rid, [])} for rid, cnt in ranked] if targets else [],
+        "candidates": [{"roster_id": rid, "matches": cnt, "players": hits.get(rid, [])} for rid, cnt in ranked],
         "guessed_roster_id": best,
-        "roster_preview": preview,
-        "note": "Provide player_names to score by matches, or omit to choose the roster with the most drafted players.",
+        "roster_preview": roster_preview,
+        "note": "Names normalized & expanded via rankings.csv. Use guessed_roster_id with /inspect_draft or /recommend_live.",
         "ts": int(time.time())
     }
-
-def _auto_choose_roster_id(requested: int, state: Dict[str,Any], by_roster: Dict[int,Set[str]]) -> int:
-    """If requested<=0, try roster_id_on_clock, else the roster with most drafted players."""
-    if isinstance(requested, int) and requested > 0:
-        return requested
-    rid_on_clock = state.get("roster_id_on_clock")
-    if isinstance(rid_on_clock, int):
-        return rid_on_clock
-    # fallback: the roster with the most drafted players
-    best_rid, best_count = None, -1
-    for rid, ids in by_roster.items():
-        c = len(ids)
-        if c > best_count:
-            best_rid, best_count = rid, c
-    return best_rid if isinstance(best_rid, int) else requested
 
 @app.post("/inspect_draft")
 async def inspect_draft(body: InspectReq, x_api_key: Optional[str] = Header(None)):
@@ -563,11 +574,8 @@ async def inspect_draft(body: InspectReq, x_api_key: Optional[str] = Header(None
     drafted_ids, by_roster = parse_drafted_from_picks(picks)
     state = await draft_state(draft_id, picks)
 
-    requested = body.roster_id
-    requested = _auto_choose_roster_id(requested, state, by_roster)
-
     eff_roster_id, eff_slot = map_slot_or_roster_id(
-        requested,
+        body.roster_id,
         state.get("slot_to_roster"),
         by_roster,
         state.get("total_teams") or 12
@@ -643,11 +651,8 @@ async def recommend_live(body: RecommendReq, x_api_key: Optional[str] = Header(N
     state = await draft_state(draft_id, picks)
     drafted_ids, by_roster = parse_drafted_from_picks(picks)
 
-    requested = body.roster_id
-    requested = _auto_choose_roster_id(requested, state, by_roster)
-
     eff_roster_id, _ = map_slot_or_roster_id(
-        requested,
+        body.roster_id,
         state.get("slot_to_roster"),
         by_roster,
         state.get("total_teams") or 12
