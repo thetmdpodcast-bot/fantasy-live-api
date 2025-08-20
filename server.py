@@ -1,6 +1,7 @@
 # server.py — Sleeper live draft → rankings.csv ("AVG") name-join + roster-aware scoring
-# Now auto-maps team slots to roster_id using slot_to_roster_id, so users can pass “Team 3” or roster_id.
-# Adds richer /inspect_draft debug to verify mapping and board state.
+# Robustly maps user-provided team slot or roster_id to the correct roster_id.
+# Handles slot_to_roster as list OR dict, 1- or 0-indexed, string or int keys.
+# Includes /inspect_draft for debug and /recommend_live for picks.
 
 import os
 import time
@@ -152,7 +153,7 @@ def _parse_pos(row: Dict[str,str]) -> Optional[str]:
     v = _row_get(row, "POS","Pos","Position","position","pos")
     if v:
         v = v.strip().upper()
-        m = re.match(r"[A-Z]+", v)  # WR1 -> WR
+        m = re.match(r"[A-Z]+", v)
         if m:
             v = m.group(0)
             if v in ALLOWED_POS: return v
@@ -234,28 +235,84 @@ def parse_drafted_from_picks(picks: List[Dict[str, Any]]) -> Tuple[Set[str], Dic
 async def get_draft_meta(draft_id: str) -> Dict[str,Any]:
     return await _get_json(f"{SLEEPER}/draft/{draft_id}")
 
-def map_slot_or_roster_id(input_id: int, slot_to_roster: List[int], by_roster: Dict[int, Set[str]]) -> Tuple[int, Optional[int]]:
+def normalize_slot_to_roster(slot_to_roster_raw: Any, total_teams: int) -> List[Optional[int]]:
     """
-    Returns (effective_roster_id, effective_team_slot)
-    - If input_id is a known roster_id (exists in by_roster), return it directly.
-    - Else if slot_to_roster present and 1<=input_id<=len(slots), treat input as slot, map to roster_id.
-    - Else return (input_id, None) as best effort.
+    Normalize Sleeper's slot_to_roster into a 1-indexed list where index i (0-based) = team slot (i+1).
+    Handles:
+      - list: [rid1, rid2, ...]
+      - dict: {"1": rid1, "2": rid2, ...} or {1: rid1, 2: rid2, ...} or 0-based keys
+    Returns a list (length may be <= total_teams if upstream is inconsistent).
+    """
+    result: List[Optional[int]] = []
+    if isinstance(slot_to_roster_raw, list):
+        # already ordered by slot (assumed 1..N)
+        result = [int(x) if isinstance(x, (int, str)) and str(x).isdigit() else None for x in slot_to_roster_raw]
+    elif isinstance(slot_to_roster_raw, dict):
+        # try 1-based numeric/string keys
+        tmp: List[Optional[int]] = []
+        for i in range(1, total_teams + 1):
+            v = slot_to_roster_raw.get(i)
+            if v is None:
+                v = slot_to_roster_raw.get(str(i))
+            if v is None:
+                # maybe dict is 0-based keys
+                v = slot_to_roster_raw.get(i - 1) or slot_to_roster_raw.get(str(i - 1))
+            if v is None:
+                tmp.append(None)
+            else:
+                try:
+                    tmp.append(int(v))
+                except Exception:
+                    tmp.append(None)
+        result = tmp
+    else:
+        result = []
+    return result
+
+def map_slot_or_roster_id(input_id: int, slot_to_roster: Any, by_roster: Dict[int, Set[str]], total_teams: int) -> Tuple[int, Optional[int]]:
+    """
+    Returns (effective_roster_id, effective_team_slot or None).
+    - If input_id is an actual roster_id (observed in picks), use it.
+    - Else, treat it as a team slot and map via slot_to_roster (robust to dict/list and indexing).
+    - If mapping fails, fall back to input_id as roster_id (but do not crash).
     """
     if input_id in by_roster:
-        # Caller gave a real roster_id
         return input_id, None
-    if slot_to_roster and 1 <= int(input_id) <= len(slot_to_roster):
-        rid = slot_to_roster[int(input_id) - 1]
-        if isinstance(rid, int):
-            return rid, int(input_id)
-    return input_id, None
+
+    normalized = normalize_slot_to_roster(slot_to_roster, total_teams)
+    eff_slot = None
+    eff_rid: Optional[int] = None
+
+    if normalized:
+        idx = int(input_id) - 1  # team slot 1..N -> 0-based
+        if 0 <= idx < len(normalized):
+            eff_rid = normalized[idx]
+            if isinstance(eff_rid, int):
+                eff_slot = int(input_id)
+
+    if isinstance(eff_rid, int):
+        return eff_rid, eff_slot
+
+    # last resort: if slot_to_roster missing, but picks show roster ids in order, map nth smallest
+    try:
+        uniq = sorted(by_roster.keys())
+        idx = int(input_id) - 1
+        if 0 <= idx < len(uniq):
+            return uniq[idx], int(input_id)
+    except Exception:
+        pass
+
+    # final fallback: return the provided value as a roster_id (best effort, never crash)
+    return int(input_id), None
 
 async def draft_state(draft_id: str, picks: List[Dict[str, Any]]) -> Dict[str, Any]:
     meta = await get_draft_meta(draft_id)
     total_teams = int(meta.get("metadata", {}).get("teams")
                       or meta.get("settings", {}).get("teams")
                       or 0)
-    slot_to_roster = meta.get("slot_to_roster_id") or meta.get("slot_to_roster") or []
+    raw_slot_to_roster = meta.get("slot_to_roster_id") or meta.get("slot_to_roster") or {}
+    normalized_slots = normalize_slot_to_roster(raw_slot_to_roster, total_teams)
+
     made = len([p for p in picks if p.get("player_id")])
 
     if not total_teams:
@@ -269,8 +326,8 @@ async def draft_state(draft_id: str, picks: List[Dict[str, Any]]) -> Dict[str, A
 
     order_index = pick_in_round if not snake_rev else (total_teams - pick_in_round + 1)
     rid_on_clock = None
-    if slot_to_roster and isinstance(slot_to_roster, list) and len(slot_to_roster) == total_teams:
-        rid_on_clock = slot_to_roster[order_index - 1]
+    if normalized_slots and 0 < order_index <= len(normalized_slots):
+        rid_on_clock = normalized_slots[order_index - 1]
     else:
         uniq = sorted({p.get("roster_id") for p in picks if isinstance(p.get("roster_id"), int)})
         if 1 <= order_index <= len(uniq):
@@ -285,7 +342,8 @@ async def draft_state(draft_id: str, picks: List[Dict[str, Any]]) -> Dict[str, A
         "snake_reversed": snake_rev,
         "team_number_on_clock": order_index,
         "roster_id_on_clock": rid_on_clock,
-        "slot_to_roster": slot_to_roster
+        "slot_to_roster": raw_slot_to_roster,
+        "slot_to_roster_normalized": normalized_slots
     }
 
 # -------------------- name-join: UNDRAFTED ↔ rankings.csv --------------------
@@ -432,8 +490,12 @@ async def inspect_draft(body: InspectReq, x_api_key: Optional[str] = Header(None
     drafted_ids, by_roster = parse_drafted_from_picks(picks)
     state = await draft_state(draft_id, picks)
 
-    # Map input roster_id (may be slot) to an effective roster_id
-    eff_roster_id, eff_slot = map_slot_or_roster_id(body.roster_id, state.get("slot_to_roster") or [], by_roster)
+    eff_roster_id, eff_slot = map_slot_or_roster_id(
+        body.roster_id,
+        state.get("slot_to_roster"),
+        by_roster,
+        state.get("total_teams") or 12
+    )
 
     my_ids = list(by_roster.get(eff_roster_id, set()))
     my_team = [{
@@ -450,14 +512,14 @@ async def inspect_draft(body: InspectReq, x_api_key: Optional[str] = Header(None
         key=lambda x: (9999.0 if x["rank_avg"] is None else x["rank_avg"])
     )[:10]
 
-    # Debug helpers
     observed_roster_ids = sorted(list(by_roster.keys()))
     by_counts = {rid: len(ids) for rid, ids in by_roster.items()}
 
     return {
         "status": "ok",
-        "draft_state": {k: v for k, v in state.items() if k != "slot_to_roster"},
-        "slot_to_roster": state.get("slot_to_roster"),
+        "draft_state": {k: v for k, v in state.items() if k not in ("slot_to_roster",)},
+        "slot_to_roster_raw": state.get("slot_to_roster"),
+        "slot_to_roster_normalized": state.get("slot_to_roster_normalized"),
         "observed_roster_ids": observed_roster_ids,
         "by_roster_counts": by_counts,
         "input_roster_or_slot": body.roster_id,
@@ -505,8 +567,12 @@ async def recommend_live(body: RecommendReq, x_api_key: Optional[str] = Header(N
     state = await draft_state(draft_id, picks)
     drafted_ids, by_roster = parse_drafted_from_picks(picks)
 
-    # Map the provided roster_id/slot to an effective roster_id
-    eff_roster_id, _ = map_slot_or_roster_id(body.roster_id, state.get("slot_to_roster") or [], by_roster)
+    eff_roster_id, _ = map_slot_or_roster_id(
+        body.roster_id,
+        state.get("slot_to_roster"),
+        by_roster,
+        state.get("total_teams") or 12
+    )
     my_ids = list(by_roster.get(eff_roster_id, set()))
 
     undrafted_pids: List[str] = [pid for pid in PLAYERS_CACHE if pid not in drafted_ids and pid not in my_ids]
@@ -516,7 +582,7 @@ async def recommend_live(body: RecommendReq, x_api_key: Optional[str] = Header(N
         return {
             "status": "no_available_after_filtering",
             "message": "No available players after filtering (no CSV matches).",
-            "draft_state": {k: v for k, v in state.items() if k != "slot_to_roster"},
+            "draft_state": {k: v for k, v in state.items() if k not in ("slot_to_roster",)},
             "recommended": [], "alternatives": [],
             "my_team": [PLAYERS_CACHE[pid] for pid in my_ids if pid in PLAYERS_CACHE],
             "drafted_count": len(drafted_ids), "my_team_count": len(my_ids),
@@ -535,7 +601,7 @@ async def recommend_live(body: RecommendReq, x_api_key: Optional[str] = Header(N
         "recommended": topn[:3],
         "alternatives": topn[3:limit],
         "my_team": [PLAYERS_CACHE[pid] for pid in my_ids if pid in PLAYERS_CACHE],
-        "draft_state": {k: v for k, v in state.items() if k != "slot_to_roster"},
+        "draft_state": {k: v for k, v in state.items() if k not in ("slot_to_roster",)},
         "effective_roster_id": eff_roster_id,
         "drafted_count": len(drafted_ids),
         "my_team_count": len(my_ids),
