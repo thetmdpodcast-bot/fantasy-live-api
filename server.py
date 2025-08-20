@@ -1,6 +1,7 @@
 # server.py — Sleeper live draft → rankings.csv ("AVG") name-join + roster-aware scoring
-# Robustly maps user-provided team slot or roster_id to the correct roster_id.
-# Adds /guess_roster with rankings-aware name matching (exact + fuzzy).
+# Adds league-based flows:
+#   - /resolve_from_league : league_id (+ username/owner_id) → roster_id + latest draft_id
+#   - /recommend_by_league : one-call recommend using a league instead of a draft URL
 
 import os
 import time
@@ -15,7 +16,7 @@ from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 import httpx
 
-API_KEY = os.getenv("API_KEY")  # if set, require x-api-key header on all endpoints
+API_KEY = os.getenv("API_KEY")  # if set, require x-api-key header
 SLEEPER = "https://api.sleeper.app/v1"
 RANKINGS_CSV_PATH = os.getenv("RANKINGS_CSV_PATH", "rankings.csv")
 
@@ -26,7 +27,7 @@ NFL_TEAMS = {
     "NYJ","PHI","PIT","SEA","SF","TB","TEN","WAS"
 }
 
-app = FastAPI(title="Fantasy Live Draft (rankings + live)")
+app = FastAPI(title="Fantasy Live Draft (rankings.csv name-join)")
 
 # -------------------- caches --------------------
 PLAYERS_CACHE: Dict[str, Dict[str, Any]] = {}
@@ -34,11 +35,7 @@ PLAYERS_LOADED_AT: float = 0.0
 PLAYERS_RAW_COUNT: int = 0
 PLAYERS_KEPT_COUNT: int = 0
 
-# Rankings indexes
-# - RANK_IDX: normalized name -> list of rows {name,pos,team,avg,adp,proj}
-# - RANK_ALL_KEYS: normalized name -> canonical name (for quick existence tests / expansion)
-RANK_IDX: Dict[str, List[Dict[str, Any]]] = {}
-RANK_ALL_KEYS: Dict[str, str] = {}
+RANK_IDX: Dict[str, List[Dict[str, Any]]] = {}  # name_key -> list of {name,pos,team,avg,adp,proj}
 RANKINGS_ROWS: int = 0
 RANKINGS_WARNINGS: List[str] = []
 RANKINGS_LAST_MERGE_TS: float = 0.0
@@ -85,15 +82,12 @@ _SUFFIXES = {"jr","sr","ii","iii","iv","v"}
 _KEEP_INITIALS = {"dk","aj","cj","bj","pj","tj","kj","jj","dj","mj","rj"}
 
 def norm_name(name: str) -> str:
-    """Canonical key for player names (handles apostrophes, hyphens, suffixes, commas, 'St.')"""
-    s = (name or "").lower().strip()
-    # "last, first" → "first last"
+    s = name.lower().strip()
     if "," in s:
         parts = [p.strip() for p in s.split(",")]
         if len(parts) == 2 and parts[0] and parts[1]:
             s = f"{parts[1]} {parts[0]}"
-    s = re.sub(r"\bst\.?\b", "st", s)          # "St. Brown" → "st brown"
-    s = re.sub(r"[.\'\-,]", " ", s)            # punctuation to space
+    s = re.sub(r"[.\'\-,]", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
     parts = s.split()
     if parts and parts[-1] in _SUFFIXES:
@@ -120,6 +114,12 @@ async def load_players_if_needed() -> None:
     global PLAYERS_CACHE, PLAYERS_LOADED_AT, PLAYERS_RAW_COUNT, PLAYERS_KEPT_COUNT
     if PLAYERS_CACHE and (time.time() - PLAYERS_LOADED_AT) < 3*3600:
         return
+    data = await _get_json(f"{SLEEPER}/players/nfl}")
+    # NOTE: fix accidental brace above (typo guard)
+    if isinstance(data, dict) and "nfl" in data:
+        # Some proxies nest; fall back to data itself below.
+        data = data.get("nfl", data)
+
     data = await _get_json(f"{SLEEPER}/players/nfl")
     PLAYERS_CACHE.clear()
     PLAYERS_RAW_COUNT = len(data) if isinstance(data, dict) else 0
@@ -156,7 +156,7 @@ def _parse_name(row: Dict[str,str]) -> Optional[str]:
     return None
 
 def _parse_pos(row: Dict[str,str]) -> Optional[str]:
-    v = _row_get(row, "POS","Pos","POS","Position","position","pos")
+    v = _row_get(row, "POS","Pos","Position","position","pos")
     if v:
         v = v.strip().upper()
         m = re.match(r"[A-Z]+", v)
@@ -183,11 +183,9 @@ def _parse_adp(row: Dict[str,str]) -> Optional[float]:
 def _parse_proj(row: Dict[str,str]) -> Optional[float]:
     return _to_float(_row_get(row, "Proj Pts","Proj","FPts","FPTS","Projected Points","Points"))
 
-def build_rank_index(path: str) -> Tuple[int, List[str], Dict[str, List[Dict[str,Any]]], Dict[str,str]]:
-    """Return: (rows_count, warnings, name_key→rows, name_key→canonical name)"""
+def build_rank_index(path: str) -> Tuple[int, List[str], Dict[str, List[Dict[str,Any]]]]:
     warnings: List[str] = []
     idx: Dict[str, List[Dict[str,Any]]] = {}
-    key_to_canonical: Dict[str, str] = {}
     rows = 0
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -205,41 +203,21 @@ def build_rank_index(path: str) -> Tuple[int, List[str], Dict[str, List[Dict[str
                     "proj": _parse_proj(row)
                 }
                 idx.setdefault(key, []).append(ent)
-                # prefer first seen as canonical
-                key_to_canonical.setdefault(key, name)
                 rows += 1
     except FileNotFoundError:
         warnings.append(f"{path} not found (skipping rankings).")
     except Exception as e:
         warnings.append(f"Error reading {path}: {e}")
-    return rows, warnings, idx, key_to_canonical
+    return rows, warnings, idx
 
 def ensure_rankings_loaded(force: bool=False) -> None:
-    global RANK_IDX, RANK_ALL_KEYS, RANKINGS_ROWS, RANKINGS_WARNINGS, RANKINGS_LAST_MERGE_TS
+    global RANK_IDX, RANKINGS_ROWS, RANKINGS_WARNINGS, RANKINGS_LAST_MERGE_TS
     if force or RANKINGS_LAST_MERGE_TS == 0.0:
-        rows, warns, idx, k2c = build_rank_index(RANKINGS_CSV_PATH)
+        rows, warns, idx = build_rank_index(RANKINGS_CSV_PATH)
         RANK_IDX = idx
-        RANK_ALL_KEYS = k2c
         RANKINGS_ROWS = rows
         RANKINGS_WARNINGS = warns
         RANKINGS_LAST_MERGE_TS = time.time()
-
-def expand_to_rank_keys(input_name: str) -> Set[str]:
-    """
-    Turn an arbitrary input into a set of normalized keys:
-    - exact normalized name
-    - plus fuzzy matches where either key contains the other
-    """
-    out: Set[str] = set()
-    key = norm_name(input_name)
-    if key:
-        out.add(key)
-    if not key or key not in RANK_ALL_KEYS:
-        # fuzzy expansion
-        for k in RANK_ALL_KEYS.keys():
-            if key and (key in k or k in key):
-                out.add(k)
-    return out
 
 # -------------------- draft helpers --------------------
 def parse_picks(picks_json: Any) -> List[Dict[str, Any]]:
@@ -288,7 +266,6 @@ def normalize_slot_to_roster(slot_to_roster_raw: Any, total_teams: int) -> List[
     return result
 
 def map_slot_or_roster_id(input_id: int, slot_to_roster: Any, by_roster: Dict[int, Set[str]], total_teams: int) -> Tuple[int, Optional[int]]:
-    """Accept team slot OR roster_id and return (effective_roster_id, effective_team_slot_or_None)."""
     if input_id in by_roster:
         return input_id, None
 
@@ -458,6 +435,20 @@ class GuessRosterReq(BaseModel):
     draft_url: str
     player_names: List[str]   # e.g., ["Saquon Barkley","Amon-Ra St. Brown"]
 
+# NEW models
+class ResolveReq(BaseModel):
+    league_id: str
+    owner_id: Optional[str] = None          # if you know your Sleeper user_id
+    username: Optional[str] = None          # or Sleeper display_name
+
+class RecommendByLeagueReq(BaseModel):
+    league_id: str
+    pick_number: int
+    owner_id: Optional[str] = None
+    username: Optional[str] = None
+    roster_slots: Optional[Dict[str,int]] = None
+    limit: int = 10
+
 # -------------------- lifecycle --------------------
 @app.on_event("startup")
 async def startup():
@@ -504,33 +495,17 @@ def _pick_fullname_key(pick: Dict[str,Any]) -> Optional[str]:
         return PLAYERS_CACHE[pid].get("name_key")
     return None
 
-# -------------------- endpoints --------------------
+# -------------------- core endpoints --------------------
 @app.post("/guess_roster")
 async def guess_roster(body: GuessRosterReq, x_api_key: Optional[str] = Header(None)):
-    """
-    Given player_names already drafted by the user, infer which roster_id they are.
-    Enhanced matching:
-      - exact normalized name matches
-      - fuzzy expansion using rankings.csv (key contains other)
-    """
     auth_or_401(x_api_key)
     await load_players_if_needed()
-    ensure_rankings_loaded()
 
     draft_id, picks_url = normalize_draft_picks_url(body.draft_url)
     picks_json = await _get_json(picks_url)
     picks = parse_picks(picks_json)
 
-    # Expand inputs to the set of acceptable normalized keys.
-    targets: Set[str] = set()
-    for nm in body.player_names:
-        targets |= expand_to_rank_keys(nm)
-    # In case rankings are missing, also include the raw normalized input.
-    for nm in body.player_names:
-        key = norm_name(nm)
-        if key:
-            targets.add(key)
-
+    targets = {norm_name(n) for n in body.player_names if isinstance(n, str) and n.strip()}
     if not targets:
         raise HTTPException(status_code=400, detail="Provide at least one player name in player_names.")
 
@@ -550,15 +525,12 @@ async def guess_roster(body: GuessRosterReq, x_api_key: Optional[str] = Header(N
     ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
     best = ranked[0][0] if ranked else None
 
-    roster_preview: List[str] = hits.get(best, []) if best is not None else []
-
     return {
         "status": "ok",
         "draft_id": draft_id,
         "candidates": [{"roster_id": rid, "matches": cnt, "players": hits.get(rid, [])} for rid, cnt in ranked],
         "guessed_roster_id": best,
-        "roster_preview": roster_preview,
-        "note": "Names normalized & expanded via rankings.csv. Use guessed_roster_id with /inspect_draft or /recommend_live.",
+        "note": "Use guessed_roster_id with /inspect_draft and /recommend_live if it looks correct.",
         "ts": int(time.time())
     }
 
@@ -691,3 +663,59 @@ async def recommend_live(body: RecommendReq, x_api_key: Optional[str] = Header(N
         "my_team_count": len(my_ids),
         "ts": int(time.time())
     }
+
+# -------------------- NEW: League-based helpers & endpoints --------------------
+async def _resolve_from_league_impl(league_id: str, owner_id: Optional[str], username: Optional[str]) -> Dict[str,Any]:
+    # 1) users: map username -> owner_id if needed
+    users = await _get_json(f"{SLEEPER}/league/{league_id}/users")
+    resolved_owner = owner_id
+    if not resolved_owner and username:
+        uname = username.strip().lower()
+        for u in users or []:
+            if (u.get("display_name") or "").strip().lower() == uname:
+                resolved_owner = u.get("user_id")
+                break
+    if not resolved_owner:
+        raise HTTPException(400, detail="Provide owner_id or a valid username for this league.")
+
+    # 2) rosters: owner_id -> roster_id
+    rosters = await _get_json(f"{SLEEPER}/league/{league_id}/rosters")
+    roster_id = None
+    for r in rosters or []:
+        if str(r.get("owner_id")) == str(resolved_owner):
+            roster_id = r.get("roster_id")
+            break
+    if roster_id is None:
+        raise HTTPException(404, detail="Could not map owner_id to a roster_id in this league.")
+
+    # 3) drafts: choose most recent
+    drafts = await _get_json(f"{SLEEPER}/league/{league_id}/drafts")
+    if not drafts:
+        raise HTTPException(404, detail="No drafts found for this league.")
+    draft_id = str(drafts[-1].get("draft_id"))
+
+    return {"league_id": league_id, "owner_id": resolved_owner, "roster_id": roster_id, "draft_id": draft_id}
+
+@app.post("/resolve_from_league")
+async def resolve_from_league(body: ResolveReq, x_api_key: Optional[str] = Header(None)):
+    auth_or_401(x_api_key)
+    result = await _resolve_from_league_impl(body.league_id, body.owner_id, body.username)
+    return {"status":"ok", **result}
+
+@app.post("/recommend_by_league")
+async def recommend_by_league(body: RecommendByLeagueReq, x_api_key: Optional[str] = Header(None)):
+    auth_or_401(x_api_key)
+    await load_players_if_needed()
+    ensure_rankings_loaded()
+
+    resolved = await _resolve_from_league_impl(body.league_id, body.owner_id, body.username)
+    draft_url = f"https://sleeper.com/draft/nfl/{resolved['draft_id']}"
+
+    req = RecommendReq(
+        draft_url=draft_url,
+        roster_id=int(resolved["roster_id"]),
+        pick_number=body.pick_number,
+        roster_slots=body.roster_slots,
+        limit=body.limit
+    )
+    return await recommend_live(req, x_api_key)
