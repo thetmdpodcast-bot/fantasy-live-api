@@ -102,7 +102,6 @@ async def resolve_draft_id_from_league(league_id: str) -> str:
 
 async def league_users_map(league_id: str) -> Dict[str, Dict[str, Any]]:
     users = await _get_json(f"{SLEEPER}/league/{league_id}/users")
-    # map owner_id -> {username, display_name}
     m: Dict[str, Dict[str, Any]] = {}
     if isinstance(users, list):
         for u in users:
@@ -124,18 +123,15 @@ async def resolve_roster_id_from_team_name(league_id: str, team_name: str) -> Op
     users = await league_users_map(league_id)
     rosters = await league_rosters_map(league_id)
     target = _casefold(team_name)
-    # try by username / display_name
     owner_ids: Set[str] = set()
     for oid, info in users.items():
         if _casefold(info.get("username")) == target or _casefold(info.get("display_name")) == target:
             owner_ids.add(oid)
-    # match roster by owner_id
     for r in rosters:
         if str(r.get("owner_id")) in owner_ids:
             rid = r.get("roster_id")
             if isinstance(rid, int):
                 return rid
-    # fallback: sometimes team_name equals r["metadata"]["team_name"]
     for r in rosters:
         meta_name = _casefold((r.get("metadata") or {}).get("team_name") or "")
         if meta_name and meta_name == target:
@@ -394,27 +390,42 @@ async def draft_state(draft_id: str, picks: List[Dict[str, Any]]) -> Dict[str, A
 
 # -------------------- name-join: UNDRAFTED ↔ rankings.csv --------------------
 def match_players_with_rankings(undrafted_pids: List[str]) -> List[Dict[str, Any]]:
-    result: List[Dict[str,Any]] = []
+    """
+    CSV-first merge logic. We set rank_avg and (if missing) proj_ros from AVG,
+    so CSV controls ordering even without explicit projections.
+    """
+    result: List[Dict[str, Any]] = []
     for pid in undrafted_pids:
         p = PLAYERS_CACHE.get(pid)
-        if not p: continue
-        rows = RANK_IDX.get(p.get("name_key"), [])
-        if not rows: continue
+        if not p:
+            continue
 
+        rows = RANK_IDX.get(p.get("name_key"), [])
+        if not rows:
+            continue
+
+        # Prefer same-position row, else first row.
         chosen = None
         for r in rows:
             if r.get("pos") == p.get("pos"):
-                chosen = r; break
-        if not chosen: chosen = rows[0]
+                chosen = r
+                break
+        if not chosen:
+            chosen = rows[0]
 
         avg = chosen.get("avg")
         proj = chosen.get("proj")
         if avg is not None:
-            p["rank_avg"] = avg
-            p["adp"] = avg
-            p["proj_ros"] = max(float(p.get("proj_ros") or 0.0), max(0.0, 400.0 - float(avg)))
+            p["rank_avg"] = float(avg)
+            p["adp"] = float(avg)
+            if p.get("proj_ros") is None:
+                p["proj_ros"] = max(0.0, 400.0 - float(avg))
         if proj is not None:
-            p["proj_ros"] = proj
+            p["proj_ros"] = float(proj)
+
+        # Useful debug for sanity during live drafts:
+        if p.get("name") in {"Saquon Barkley", "Christian McCaffrey"}:
+            print("CSV MERGE ▶", p["name"], "AVG=", p.get("rank_avg"), "POS=", p.get("pos"))
 
         result.append(p)
     return result
@@ -439,6 +450,10 @@ def compute_needs(my_ids: List[str], slots: Dict[str,int]) -> Dict[str,float]:
     return needs
 
 def score_available(available: List[Dict[str,Any]], my_ids: List[str], slots: Dict[str,int], pick_number: int) -> List[Dict[str,Any]]:
+    """
+    CSV-first scoring: lower AVG ⇒ higher score (dominant). Projections and ADP
+    provide minor tie-break nudges; roster needs/caps modulate the final score.
+    """
     needs = compute_needs(my_ids, slots)
     pos_counts: Dict[str,int] = {}
     for pid in my_ids:
@@ -451,16 +466,27 @@ def score_available(available: List[Dict[str,Any]], my_ids: List[str], slots: Di
     scored: List[Dict[str,Any]] = []
     for p in available:
         pos = p["pos"]
+
+        # CSV-driven component (dominant)
+        ra = p.get("rank_avg")
+        csv_score = 0.0
+        if isinstance(ra, (int, float)):
+            csv_score = 2000.0 / (1.0 + float(ra))
+
+        # Small helpers
         proj = float(p.get("proj_ros") or 0.0)
         adp = p.get("adp")
         adp_discount = (adp_median - adp) if (adp_median is not None and isinstance(adp,(int,float))) else 0.0
+
+        # Needs / cap
         need_boost = needs.get(pos,1.0)
         cur = pos_counts.get(pos,0)
         cap = roster_cap(pos, slots)
         overdrafted = max(0, cur - cap)
         cap_penalty = 0.85 ** overdrafted
 
-        score = proj + 0.15 * adp_discount
+        # Final blend — CSV dominates
+        score = (csv_score * 1.00) + (proj * 0.20) + (adp_discount * 0.05)
         score *= (0.85 + 0.30 * need_boost)
         score *= cap_penalty
 
@@ -470,7 +496,7 @@ def score_available(available: List[Dict[str,Any]], my_ids: List[str], slots: Di
             "adp": p.get("adp"), "rank_avg": p.get("rank_avg"),
             "proj_ros": p.get("proj_ros"),
             "score": round(score,3),
-            "explain": f"{pos} need {need_boost:.2f}, cap {cur}/{cap}, pick {pick_number}"
+            "explain": f"csv={round(csv_score,1)} (AVG={ra}), proj={proj}, need {need_boost:.2f}, cap {cur}/{cap}, pick {pick_number}"
         })
 
     scored.sort(key=lambda x: x["score"], reverse=True)
