@@ -1,7 +1,8 @@
-# server.py — Sleeper live draft → rankings.csv ("AVG") name-join + roster-aware scoring
-# Adds league-based flows:
-#   - /resolve_from_league : league_id (+ username/owner_id) → roster_id + latest draft_id
-#   - /recommend_by_league : one-call recommend using a league instead of a draft URL
+# server.py — Sleeper live draft → rankings.csv ("AVG") join + roster-aware scoring
+# - No pandas
+# - Works with either draft_url OR league_id
+# - Team can be roster_id, team_slot, or owner/team_name (when league_id is provided)
+# - Adds /guess_roster, /inspect_draft, /recommend_live
 
 import os
 import time
@@ -10,7 +11,7 @@ import random
 import re
 import math
 import csv
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
@@ -27,7 +28,7 @@ NFL_TEAMS = {
     "NYJ","PHI","PIT","SEA","SF","TB","TEN","WAS"
 }
 
-app = FastAPI(title="Fantasy Live Draft (rankings.csv name-join)")
+app = FastAPI(title="Fantasy Live Draft (rankings.csv + Sleeper)")
 
 # -------------------- caches --------------------
 PLAYERS_CACHE: Dict[str, Dict[str, Any]] = {}
@@ -68,8 +69,9 @@ async def _get_json(url: str) -> Any:
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Couldn't parse JSON at {url}: {e}")
 
-# -------------------- draft URL normalize --------------------
+# -------------------- draft URL / league helpers --------------------
 _DRAFT_ID_RE = re.compile(r"(?P<id>\d{16,20})")
+
 def normalize_draft_picks_url(draft_url_or_page: str) -> Tuple[str,str]:
     m = _DRAFT_ID_RE.search(draft_url_or_page)
     if not m:
@@ -77,12 +79,77 @@ def normalize_draft_picks_url(draft_url_or_page: str) -> Tuple[str,str]:
     draft_id = m.group("id")
     return draft_id, f"{SLEEPER}/draft/{draft_id}/picks"
 
+async def resolve_draft_id_from_league(league_id: str) -> str:
+    drafts = await _get_json(f"{SLEEPER}/league/{league_id}/drafts")
+    if not isinstance(drafts, list) or not drafts:
+        raise HTTPException(status_code=404, detail=f"No drafts found for league {league_id}.")
+    # preference: in_progress > pre_draft > latest updated_at
+    def weight(d: Dict[str, Any]) -> Tuple[int, int]:
+        status = (d.get("status") or "").lower()
+        if status == "in_progress":
+            s = 3
+        elif status == "pre_draft":
+            s = 2
+        else:
+            s = 1
+        updated = int(d.get("updated_at") or d.get("start_time") or 0)
+        return (s, updated)
+    best = sorted(drafts, key=weight, reverse=True)[0]
+    did = best.get("draft_id") or best.get("id")
+    if not did:
+        raise HTTPException(status_code=500, detail="Could not determine draft_id from league drafts.")
+    return str(did)
+
+async def league_users_map(league_id: str) -> Dict[str, Dict[str, Any]]:
+    users = await _get_json(f"{SLEEPER}/league/{league_id}/users")
+    # map owner_id -> {username, display_name}
+    m: Dict[str, Dict[str, Any]] = {}
+    if isinstance(users, list):
+        for u in users:
+            if not isinstance(u, dict): continue
+            m[str(u.get("user_id"))] = {
+                "username": u.get("username") or "",
+                "display_name": (u.get("display_name") or u.get("metadata", {}).get("team_name")) or ""
+            }
+    return m
+
+async def league_rosters_map(league_id: str) -> List[Dict[str, Any]]:
+    rosters = await _get_json(f"{SLEEPER}/league/{league_id}/rosters")
+    return rosters if isinstance(rosters, list) else []
+
+def _casefold(s: str) -> str:
+    return (s or "").strip().casefold()
+
+async def resolve_roster_id_from_team_name(league_id: str, team_name: str) -> Optional[int]:
+    users = await league_users_map(league_id)
+    rosters = await league_rosters_map(league_id)
+    target = _casefold(team_name)
+    # try by username / display_name
+    owner_ids: Set[str] = set()
+    for oid, info in users.items():
+        if _casefold(info.get("username")) == target or _casefold(info.get("display_name")) == target:
+            owner_ids.add(oid)
+    # match roster by owner_id
+    for r in rosters:
+        if str(r.get("owner_id")) in owner_ids:
+            rid = r.get("roster_id")
+            if isinstance(rid, int):
+                return rid
+    # fallback: sometimes team_name equals r["metadata"]["team_name"]
+    for r in rosters:
+        meta_name = _casefold((r.get("metadata") or {}).get("team_name") or "")
+        if meta_name and meta_name == target:
+            rid = r.get("roster_id")
+            if isinstance(rid, int):
+                return rid
+    return None
+
 # -------------------- utils --------------------
 _SUFFIXES = {"jr","sr","ii","iii","iv","v"}
 _KEEP_INITIALS = {"dk","aj","cj","bj","pj","tj","kj","jj","dj","mj","rj"}
 
 def norm_name(name: str) -> str:
-    s = name.lower().strip()
+    s = (name or "").lower().strip()
     if "," in s:
         parts = [p.strip() for p in s.split(",")]
         if len(parts) == 2 and parts[0] and parts[1]:
@@ -114,12 +181,6 @@ async def load_players_if_needed() -> None:
     global PLAYERS_CACHE, PLAYERS_LOADED_AT, PLAYERS_RAW_COUNT, PLAYERS_KEPT_COUNT
     if PLAYERS_CACHE and (time.time() - PLAYERS_LOADED_AT) < 3*3600:
         return
-    data = await _get_json(f"{SLEEPER}/players/nfl}")
-    # NOTE: fix accidental brace above (typo guard)
-    if isinstance(data, dict) and "nfl" in data:
-        # Some proxies nest; fall back to data itself below.
-        data = data.get("nfl", data)
-
     data = await _get_json(f"{SLEEPER}/players/nfl")
     PLAYERS_CACHE.clear()
     PLAYERS_RAW_COUNT = len(data) if isinstance(data, dict) else 0
@@ -248,11 +309,8 @@ def normalize_slot_to_roster(slot_to_roster_raw: Any, total_teams: int) -> List[
     elif isinstance(slot_to_roster_raw, dict):
         tmp: List[Optional[int]] = []
         for i in range(1, total_teams + 1):
-            v = slot_to_roster_raw.get(i)
-            if v is None:
-                v = slot_to_roster_raw.get(str(i))
-            if v is None:
-                v = slot_to_roster_raw.get(i - 1) or slot_to_roster_raw.get(str(i - 1))
+            v = slot_to_roster_raw.get(i) or slot_to_roster_raw.get(str(i)) \
+                or slot_to_roster_raw.get(i - 1) or slot_to_roster_raw.get(str(i - 1))
             if v is None:
                 tmp.append(None)
             else:
@@ -420,34 +478,31 @@ def score_available(available: List[Dict[str,Any]], my_ids: List[str], slots: Di
 
 # -------------------- request models --------------------
 class RecommendReq(BaseModel):
-    draft_url: str
-    roster_id: int          # may be a real roster_id OR the team slot number (1..N)
+    # identify draft
+    draft_url: Optional[str] = None
+    league_id: Optional[str] = None
+
+    # identify team
+    roster_id: Optional[int] = None        # Sleeper roster_id
+    team_slot: Optional[int] = None        # draft position 1..N (we'll map it)
+    team_name: Optional[str] = None        # username/display_name/team_name (requires league_id)
+
+    # pick context
     pick_number: int
     season: int = 2025
     roster_slots: Optional[Dict[str,int]] = None
     limit: int = 10
 
 class InspectReq(BaseModel):
-    draft_url: str
-    roster_id: int          # may be a real roster_id OR the team slot number
+    draft_url: Optional[str] = None
+    league_id: Optional[str] = None
+    roster_id: Optional[int] = None
+    team_slot: Optional[int] = None
+    team_name: Optional[str] = None
 
 class GuessRosterReq(BaseModel):
     draft_url: str
     player_names: List[str]   # e.g., ["Saquon Barkley","Amon-Ra St. Brown"]
-
-# NEW models
-class ResolveReq(BaseModel):
-    league_id: str
-    owner_id: Optional[str] = None          # if you know your Sleeper user_id
-    username: Optional[str] = None          # or Sleeper display_name
-
-class RecommendByLeagueReq(BaseModel):
-    league_id: str
-    pick_number: int
-    owner_id: Optional[str] = None
-    username: Optional[str] = None
-    roster_slots: Optional[Dict[str,int]] = None
-    limit: int = 10
 
 # -------------------- lifecycle --------------------
 @app.on_event("startup")
@@ -495,7 +550,7 @@ def _pick_fullname_key(pick: Dict[str,Any]) -> Optional[str]:
         return PLAYERS_CACHE[pid].get("name_key")
     return None
 
-# -------------------- core endpoints --------------------
+# -------------------- endpoints --------------------
 @app.post("/guess_roster")
 async def guess_roster(body: GuessRosterReq, x_api_key: Optional[str] = Header(None)):
     auth_or_401(x_api_key)
@@ -534,26 +589,76 @@ async def guess_roster(body: GuessRosterReq, x_api_key: Optional[str] = Header(N
         "ts": int(time.time())
     }
 
+async def _resolve_draft_and_team(
+    draft_url: Optional[str],
+    league_id: Optional[str],
+    roster_id: Optional[int],
+    team_slot: Optional[int],
+    team_name: Optional[str],
+    by_roster: Dict[int, Set[str]],
+    state: Dict[str, Any]
+) -> Tuple[str, int, Optional[int]]:
+    # draft id
+    if draft_url:
+        draft_id, _ = normalize_draft_picks_url(draft_url)
+    elif league_id:
+        draft_id = await resolve_draft_id_from_league(league_id)
+    else:
+        raise HTTPException(status_code=400, detail="Provide draft_url or league_id.")
+
+    # team / roster_id
+    eff_rid: Optional[int] = None
+    eff_slot: Optional[int] = None
+
+    # 1) explicit roster_id
+    if isinstance(rid := roster_id, int):
+        eff_rid, eff_slot = map_slot_or_roster_id(rid, state.get("slot_to_roster"), by_roster, state.get("total_teams") or 12)
+    # 2) team_slot mapping
+    elif isinstance(team_slot, int):
+        eff_rid, eff_slot = map_slot_or_roster_id(team_slot, state.get("slot_to_roster"), by_roster, state.get("total_teams") or 12)
+    # 3) team_name + league_id
+    elif team_name and league_id:
+        maybe = await resolve_roster_id_from_team_name(league_id, team_name)
+        if maybe is not None:
+            eff_rid, eff_slot = map_slot_or_roster_id(maybe, state.get("slot_to_roster"), by_roster, state.get("total_teams") or 12)
+
+    # 4) still nothing? best-effort: default to first observed roster
+    if eff_rid is None:
+        if by_roster:
+            eff_rid = sorted(by_roster.keys())[0]
+        else:
+            eff_rid = 1
+
+    return draft_id, eff_rid, eff_slot
+
 @app.post("/inspect_draft")
 async def inspect_draft(body: InspectReq, x_api_key: Optional[str] = Header(None)):
     auth_or_401(x_api_key)
     await load_players_if_needed()
     ensure_rankings_loaded()
 
-    draft_id, picks_url = normalize_draft_picks_url(body.draft_url)
+    # figure out draft_id (draft_url or league_id) to fetch picks FIRST
+    if body.draft_url:
+        draft_id, picks_url = normalize_draft_picks_url(body.draft_url)
+    elif body.league_id:
+        draft_id = await resolve_draft_id_from_league(body.league_id)
+        picks_url = f"{SLEEPER}/draft/{draft_id}/picks"
+    else:
+        raise HTTPException(status_code=400, detail="Provide draft_url or league_id.")
+
     picks_json = await _get_json(picks_url)
     picks = parse_picks(picks_json)
     drafted_ids, by_roster = parse_drafted_from_picks(picks)
     state = await draft_state(draft_id, picks)
 
-    eff_roster_id, eff_slot = map_slot_or_roster_id(
-        body.roster_id,
-        state.get("slot_to_roster"),
-        by_roster,
-        state.get("total_teams") or 12
+    # resolve team
+    _, eff_rid, eff_slot = await _resolve_draft_and_team(
+        draft_url=body.draft_url, league_id=body.league_id,
+        roster_id=body.roster_id, team_slot=body.team_slot, team_name=body.team_name,
+        by_roster=by_roster, state=state
     )
 
-    my_ids = list(by_roster.get(eff_roster_id, set()))
+    my_ids = list(by_roster.get(eff_rid, set()))
     my_team = [{
         "id": pid,
         "name": PLAYERS_CACHE[pid]["name"],
@@ -578,8 +683,14 @@ async def inspect_draft(body: InspectReq, x_api_key: Optional[str] = Header(None
         "slot_to_roster_normalized": state.get("slot_to_roster_normalized"),
         "observed_roster_ids": observed_roster_ids,
         "by_roster_counts": by_counts,
-        "input_roster_or_slot": body.roster_id,
-        "effective_roster_id": eff_roster_id,
+        "input": {
+            "draft_url": body.draft_url,
+            "league_id": body.league_id,
+            "roster_id": body.roster_id,
+            "team_slot": body.team_slot,
+            "team_name": body.team_name,
+        },
+        "effective_roster_id": eff_rid,
         "effective_team_slot": eff_slot,
         "my_team": my_team,
         "drafted_count": len(drafted_ids),
@@ -596,7 +707,15 @@ async def recommend_live(body: RecommendReq, x_api_key: Optional[str] = Header(N
     await load_players_if_needed()
     ensure_rankings_loaded()
 
-    draft_id, picks_url = normalize_draft_picks_url(body.draft_url)
+    # figure out draft_id + picks_url
+    if body.draft_url:
+        draft_id, picks_url = normalize_draft_picks_url(body.draft_url)
+    elif body.league_id:
+        draft_id = await resolve_draft_id_from_league(body.league_id)
+        picks_url = f"{SLEEPER}/draft/{draft_id}/picks"
+    else:
+        raise HTTPException(status_code=400, detail="Provide draft_url or league_id.")
+
     try:
         picks_json = await _get_json(picks_url)
     except HTTPException as e:
@@ -623,13 +742,13 @@ async def recommend_live(body: RecommendReq, x_api_key: Optional[str] = Header(N
     state = await draft_state(draft_id, picks)
     drafted_ids, by_roster = parse_drafted_from_picks(picks)
 
-    eff_roster_id, _ = map_slot_or_roster_id(
-        body.roster_id,
-        state.get("slot_to_roster"),
-        by_roster,
-        state.get("total_teams") or 12
+    _, eff_rid, _ = await _resolve_draft_and_team(
+        draft_url=body.draft_url, league_id=body.league_id,
+        roster_id=body.roster_id, team_slot=body.team_slot, team_name=body.team_name,
+        by_roster=by_roster, state=state
     )
-    my_ids = list(by_roster.get(eff_roster_id, set()))
+
+    my_ids = list(by_roster.get(eff_rid, set()))
 
     undrafted_pids: List[str] = [pid for pid in PLAYERS_CACHE if pid not in drafted_ids and pid not in my_ids]
     available_enriched = match_players_with_rankings(undrafted_pids)
@@ -658,64 +777,8 @@ async def recommend_live(body: RecommendReq, x_api_key: Optional[str] = Header(N
         "alternatives": topn[3:limit],
         "my_team": [PLAYERS_CACHE[pid] for pid in my_ids if pid in PLAYERS_CACHE],
         "draft_state": {k: v for k, v in state.items() if k not in ("slot_to_roster",)},
-        "effective_roster_id": eff_roster_id,
+        "effective_roster_id": eff_rid,
         "drafted_count": len(drafted_ids),
         "my_team_count": len(my_ids),
         "ts": int(time.time())
     }
-
-# -------------------- NEW: League-based helpers & endpoints --------------------
-async def _resolve_from_league_impl(league_id: str, owner_id: Optional[str], username: Optional[str]) -> Dict[str,Any]:
-    # 1) users: map username -> owner_id if needed
-    users = await _get_json(f"{SLEEPER}/league/{league_id}/users")
-    resolved_owner = owner_id
-    if not resolved_owner and username:
-        uname = username.strip().lower()
-        for u in users or []:
-            if (u.get("display_name") or "").strip().lower() == uname:
-                resolved_owner = u.get("user_id")
-                break
-    if not resolved_owner:
-        raise HTTPException(400, detail="Provide owner_id or a valid username for this league.")
-
-    # 2) rosters: owner_id -> roster_id
-    rosters = await _get_json(f"{SLEEPER}/league/{league_id}/rosters")
-    roster_id = None
-    for r in rosters or []:
-        if str(r.get("owner_id")) == str(resolved_owner):
-            roster_id = r.get("roster_id")
-            break
-    if roster_id is None:
-        raise HTTPException(404, detail="Could not map owner_id to a roster_id in this league.")
-
-    # 3) drafts: choose most recent
-    drafts = await _get_json(f"{SLEEPER}/league/{league_id}/drafts")
-    if not drafts:
-        raise HTTPException(404, detail="No drafts found for this league.")
-    draft_id = str(drafts[-1].get("draft_id"))
-
-    return {"league_id": league_id, "owner_id": resolved_owner, "roster_id": roster_id, "draft_id": draft_id}
-
-@app.post("/resolve_from_league")
-async def resolve_from_league(body: ResolveReq, x_api_key: Optional[str] = Header(None)):
-    auth_or_401(x_api_key)
-    result = await _resolve_from_league_impl(body.league_id, body.owner_id, body.username)
-    return {"status":"ok", **result}
-
-@app.post("/recommend_by_league")
-async def recommend_by_league(body: RecommendByLeagueReq, x_api_key: Optional[str] = Header(None)):
-    auth_or_401(x_api_key)
-    await load_players_if_needed()
-    ensure_rankings_loaded()
-
-    resolved = await _resolve_from_league_impl(body.league_id, body.owner_id, body.username)
-    draft_url = f"https://sleeper.com/draft/nfl/{resolved['draft_id']}"
-
-    req = RecommendReq(
-        draft_url=draft_url,
-        roster_id=int(resolved["roster_id"]),
-        pick_number=body.pick_number,
-        roster_slots=body.roster_slots,
-        limit=body.limit
-    )
-    return await recommend_live(req, x_api_key)
