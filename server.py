@@ -1,7 +1,6 @@
 # server.py — Sleeper live draft → rankings.csv ("AVG") name-join + roster-aware scoring
 # Robustly maps user-provided team slot or roster_id to the correct roster_id.
-# Handles slot_to_roster as list OR dict, 1- or 0-indexed, string or int keys.
-# Includes /inspect_draft for debug and /recommend_live for picks.
+# Adds /guess_roster to infer roster_id from already-drafted player names.
 
 import os
 import time
@@ -236,26 +235,16 @@ async def get_draft_meta(draft_id: str) -> Dict[str,Any]:
     return await _get_json(f"{SLEEPER}/draft/{draft_id}")
 
 def normalize_slot_to_roster(slot_to_roster_raw: Any, total_teams: int) -> List[Optional[int]]:
-    """
-    Normalize Sleeper's slot_to_roster into a 1-indexed list where index i (0-based) = team slot (i+1).
-    Handles:
-      - list: [rid1, rid2, ...]
-      - dict: {"1": rid1, "2": rid2, ...} or {1: rid1, 2: rid2, ...} or 0-based keys
-    Returns a list (length may be <= total_teams if upstream is inconsistent).
-    """
     result: List[Optional[int]] = []
     if isinstance(slot_to_roster_raw, list):
-        # already ordered by slot (assumed 1..N)
         result = [int(x) if isinstance(x, (int, str)) and str(x).isdigit() else None for x in slot_to_roster_raw]
     elif isinstance(slot_to_roster_raw, dict):
-        # try 1-based numeric/string keys
         tmp: List[Optional[int]] = []
         for i in range(1, total_teams + 1):
             v = slot_to_roster_raw.get(i)
             if v is None:
                 v = slot_to_roster_raw.get(str(i))
             if v is None:
-                # maybe dict is 0-based keys
                 v = slot_to_roster_raw.get(i - 1) or slot_to_roster_raw.get(str(i - 1))
             if v is None:
                 tmp.append(None)
@@ -270,12 +259,6 @@ def normalize_slot_to_roster(slot_to_roster_raw: Any, total_teams: int) -> List[
     return result
 
 def map_slot_or_roster_id(input_id: int, slot_to_roster: Any, by_roster: Dict[int, Set[str]], total_teams: int) -> Tuple[int, Optional[int]]:
-    """
-    Returns (effective_roster_id, effective_team_slot or None).
-    - If input_id is an actual roster_id (observed in picks), use it.
-    - Else, treat it as a team slot and map via slot_to_roster (robust to dict/list and indexing).
-    - If mapping fails, fall back to input_id as roster_id (but do not crash).
-    """
     if input_id in by_roster:
         return input_id, None
 
@@ -284,7 +267,7 @@ def map_slot_or_roster_id(input_id: int, slot_to_roster: Any, by_roster: Dict[in
     eff_rid: Optional[int] = None
 
     if normalized:
-        idx = int(input_id) - 1  # team slot 1..N -> 0-based
+        idx = int(input_id) - 1
         if 0 <= idx < len(normalized):
             eff_rid = normalized[idx]
             if isinstance(eff_rid, int):
@@ -293,7 +276,6 @@ def map_slot_or_roster_id(input_id: int, slot_to_roster: Any, by_roster: Dict[in
     if isinstance(eff_rid, int):
         return eff_rid, eff_slot
 
-    # last resort: if slot_to_roster missing, but picks show roster ids in order, map nth smallest
     try:
         uniq = sorted(by_roster.keys())
         idx = int(input_id) - 1
@@ -302,7 +284,6 @@ def map_slot_or_roster_id(input_id: int, slot_to_roster: Any, by_roster: Dict[in
     except Exception:
         pass
 
-    # final fallback: return the provided value as a roster_id (best effort, never crash)
     return int(input_id), None
 
 async def draft_state(draft_id: str, picks: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -420,7 +401,7 @@ def score_available(available: List[Dict[str,Any]], my_ids: List[str], slots: Di
 
         scored.append({
             "id": p["id"], "name": p.get("name"), "team": p.get("team"),
-            "pos": pos, "bye": p.get("bye"),
+            "pos": p["pos"], "bye": p.get("bye"),
             "adp": p.get("adp"), "rank_avg": p.get("rank_avg"),
             "proj_ros": p.get("proj_ros"),
             "score": round(score,3),
@@ -442,6 +423,10 @@ class RecommendReq(BaseModel):
 class InspectReq(BaseModel):
     draft_url: str
     roster_id: int          # may be a real roster_id OR the team slot number
+
+class GuessRosterReq(BaseModel):
+    draft_url: str
+    player_names: List[str]   # e.g., ["Saquon Barkley","Amon-Ra St. Brown"]
 
 # -------------------- lifecycle --------------------
 @app.on_event("startup")
@@ -477,7 +462,63 @@ def health():
         "ts": int(time.time())
     }
 
+# -------------------- helpers for guessing roster --------------------
+def _pick_fullname_key(pick: Dict[str,Any]) -> Optional[str]:
+    md = pick.get("metadata") or {}
+    # Sleeper usually provides first/last names in metadata
+    fn = (md.get("first_name") or "").strip()
+    ln = (md.get("last_name") or "").strip()
+    if fn or ln:
+        return norm_name(f"{fn} {ln}".strip())
+    # Fallback: if we can map by player_id and we have it in cache
+    pid = str(pick.get("player_id") or "")
+    if pid in PLAYERS_CACHE:
+        return PLAYERS_CACHE[pid].get("name_key")
+    return None
+
 # -------------------- endpoints --------------------
+@app.post("/guess_roster")
+async def guess_roster(body: GuessRosterReq, x_api_key: Optional[str] = Header(None)):
+    auth_or_401(x_api_key)
+    await load_players_if_needed()
+
+    draft_id, picks_url = normalize_draft_picks_url(body.draft_url)
+    picks_json = await _get_json(picks_url)
+    picks = parse_picks(picks_json)
+
+    # Normalize target names
+    targets = {norm_name(n) for n in body.player_names if isinstance(n, str) and n.strip()}
+    if not targets:
+        raise HTTPException(status_code=400, detail="Provide at least one player name in player_names.")
+
+    # Build scores by roster_id
+    scores: Dict[int,int] = {}
+    hits: Dict[int,List[str]] = {}
+    for p in picks:
+        rid = p.get("roster_id")
+        if not isinstance(rid, int): continue
+        key = _pick_fullname_key(p)
+        if not key: continue
+        if key in targets:
+            scores[rid] = scores.get(rid, 0) + 1
+            # keep the human-readable form
+            md = p.get("metadata") or {}
+            pretty = f"{md.get('first_name','').strip()} {md.get('last_name','').strip()}".strip() or key
+            hits.setdefault(rid, []).append(pretty)
+
+    # Rank candidates
+    ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
+    best = ranked[0][0] if ranked else None
+
+    return {
+        "status": "ok",
+        "draft_id": draft_id,
+        "candidates": [{"roster_id": rid, "matches": cnt, "players": hits.get(rid, [])} for rid, cnt in ranked],
+        "guessed_roster_id": best,
+        "note": "Use guessed_roster_id with /inspect_draft and /recommend_live if it looks correct.",
+        "ts": int(time.time())
+    }
+
 @app.post("/inspect_draft")
 async def inspect_draft(body: InspectReq, x_api_key: Optional[str] = Header(None)):
     auth_or_401(x_api_key)
