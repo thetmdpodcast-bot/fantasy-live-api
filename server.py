@@ -3,6 +3,7 @@
 # - Works with either draft_url OR league_id
 # - Team can be roster_id, team_slot, or owner/team_name (when league_id is provided)
 # - Adds /guess_roster, /inspect_draft, /recommend_live
+# - NEW: robust team_slot ⇒ roster_id fallback using live picks (round-1 / first-N unique)
 
 import os
 import time
@@ -83,15 +84,9 @@ async def resolve_draft_id_from_league(league_id: str) -> str:
     drafts = await _get_json(f"{SLEEPER}/league/{league_id}/drafts")
     if not isinstance(drafts, list) or not drafts:
         raise HTTPException(status_code=404, detail=f"No drafts found for league {league_id}.")
-    # preference: in_progress > pre_draft > latest updated_at
     def weight(d: Dict[str, Any]) -> Tuple[int, int]:
         status = (d.get("status") or "").lower()
-        if status == "in_progress":
-            s = 3
-        elif status == "pre_draft":
-            s = 2
-        else:
-            s = 1
+        s = 3 if status == "in_progress" else 2 if status == "pre_draft" else 1
         updated = int(d.get("updated_at") or d.get("start_time") or 0)
         return (s, updated)
     best = sorted(drafts, key=weight, reverse=True)[0]
@@ -276,7 +271,7 @@ def ensure_rankings_loaded(force: bool=False) -> None:
         RANKINGS_WARNINGS = warns
         RANKINGS_LAST_MERGE_TS = time.time()
 
-# -------------------- draft helpers --------------------
+# -------------------- picks parsing --------------------
 def parse_picks(picks_json: Any) -> List[Dict[str, Any]]:
     if isinstance(picks_json, list): return picks_json
     if isinstance(picks_json, dict) and isinstance(picks_json.get("picks"), list):
@@ -295,14 +290,53 @@ def parse_drafted_from_picks(picks: List[Dict[str, Any]]) -> Tuple[Set[str], Dic
                 by_roster.setdefault(rid, set()).add(str(pid))
     return drafted, by_roster
 
-async def get_draft_meta(draft_id: str) -> Dict[str,Any]:
-    return await _get_json(f"{SLEEPER}/draft/{draft_id}")
+# -------------------- NEW: derive slot→roster from picks when missing --------------------
+def _roster_order_from_round1(picks: List[Dict[str, Any]], total_teams: int) -> List[Optional[int]]:
+    round1 = [p for p in picks if int(p.get("round") or 0) == 1 and isinstance(p.get("roster_id"), int)]
+    def _ord(p):
+        return int(p.get("pick_no") or p.get("pick_in_round") or 10**9)
+    round1.sort(key=_ord)
+    order: List[Optional[int]] = []
+    seen = set()
+    for p in round1:
+        rid = int(p["roster_id"])
+        if rid in seen:
+            continue
+        order.append(rid)
+        seen.add(rid)
+        if len(order) >= total_teams:
+            break
+    while len(order) < total_teams:
+        order.append(None)
+    return order
 
-def normalize_slot_to_roster(slot_to_roster_raw: Any, total_teams: int) -> List[Optional[int]]:
-    result: List[Optional[int]] = []
-    if isinstance(slot_to_roster_raw, list):
-        result = [int(x) if isinstance(x, (int, str)) and str(x).isdigit() else None for x in slot_to_roster_raw]
-    elif isinstance(slot_to_roster_raw, dict):
+def _roster_order_from_first_unique(picks: List[Dict[str, Any]], total_teams: int) -> List[Optional[int]]:
+    order: List[Optional[int]] = []
+    seen = set()
+    for p in picks:
+        rid = p.get("roster_id")
+        if not isinstance(rid, int):
+            continue
+        if rid in seen:
+            continue
+        order.append(int(rid))
+        seen.add(rid)
+        if len(order) >= total_teams:
+            break
+    while len(order) < total_teams:
+        order.append(None)
+    return order
+
+def normalize_slot_to_roster(
+    slot_to_roster_raw: Any,
+    total_teams: int,
+    picks: Optional[List[Dict[str, Any]]] = None
+) -> List[Optional[int]]:
+    # 1) use server-provided mapping if present
+    if isinstance(slot_to_roster_raw, list) and slot_to_roster_raw:
+        return [int(x) if isinstance(x, (int, str)) and str(x).isdigit() else None
+                for x in slot_to_roster_raw]
+    if isinstance(slot_to_roster_raw, dict) and slot_to_roster_raw:
         tmp: List[Optional[int]] = []
         for i in range(1, total_teams + 1):
             v = slot_to_roster_raw.get(i) or slot_to_roster_raw.get(str(i)) \
@@ -314,38 +348,22 @@ def normalize_slot_to_roster(slot_to_roster_raw: Any, total_teams: int) -> List[
                     tmp.append(int(v))
                 except Exception:
                     tmp.append(None)
-        result = tmp
-    else:
-        result = []
-    return result
+        return tmp
 
-def map_slot_or_roster_id(input_id: int, slot_to_roster: Any, by_roster: Dict[int, Set[str]], total_teams: int) -> Tuple[int, Optional[int]]:
-    if input_id in by_roster:
-        return input_id, None
+    # 2) derive from picks
+    if picks:
+        order = _roster_order_from_round1(picks, total_teams)
+        if any(x is not None for x in order):
+            return order
+        order = _roster_order_from_first_unique(picks, total_teams)
+        if any(x is not None for x in order):
+            return order
 
-    normalized = normalize_slot_to_roster(slot_to_roster, total_teams)
-    eff_slot = None
-    eff_rid: Optional[int] = None
+    # 3) fallback
+    return [None] * max(1, total_teams)
 
-    if normalized:
-        idx = int(input_id) - 1
-        if 0 <= idx < len(normalized):
-            eff_rid = normalized[idx]
-            if isinstance(eff_rid, int):
-                eff_slot = int(input_id)
-
-    if isinstance(eff_rid, int):
-        return eff_rid, eff_slot
-
-    try:
-        uniq = sorted(by_roster.keys())
-        idx = int(input_id) - 1
-        if 0 <= idx < len(uniq):
-            return uniq[idx], int(input_id)
-    except Exception:
-        pass
-
-    return int(input_id), None
+async def get_draft_meta(draft_id: str) -> Dict[str,Any]:
+    return await _get_json(f"{SLEEPER}/draft/{draft_id}")
 
 async def draft_state(draft_id: str, picks: List[Dict[str, Any]]) -> Dict[str, Any]:
     meta = await get_draft_meta(draft_id)
@@ -353,14 +371,14 @@ async def draft_state(draft_id: str, picks: List[Dict[str, Any]]) -> Dict[str, A
                       or meta.get("settings", {}).get("teams")
                       or 0)
     raw_slot_to_roster = meta.get("slot_to_roster_id") or meta.get("slot_to_roster") or {}
-    normalized_slots = normalize_slot_to_roster(raw_slot_to_roster, total_teams)
-
-    made = len([p for p in picks if p.get("player_id")])
 
     if not total_teams:
         roster_ids = {p.get("roster_id") for p in picks if isinstance(p.get("roster_id"), int)}
         total_teams = len(roster_ids) or 12
 
+    normalized_slots = normalize_slot_to_roster(raw_slot_to_roster, total_teams, picks=picks)
+
+    made = len([p for p in picks if p.get("player_id")])
     on_index = made + 1
     cur_round = max(1, math.ceil(on_index / total_teams))
     pick_in_round = ((on_index - 1) % total_teams) + 1
@@ -370,10 +388,6 @@ async def draft_state(draft_id: str, picks: List[Dict[str, Any]]) -> Dict[str, A
     rid_on_clock = None
     if normalized_slots and 0 < order_index <= len(normalized_slots):
         rid_on_clock = normalized_slots[order_index - 1]
-    else:
-        uniq = sorted({p.get("roster_id") for p in picks if isinstance(p.get("roster_id"), int)})
-        if 1 <= order_index <= len(uniq):
-            rid_on_clock = uniq[order_index - 1]
 
     return {
         "draft_id": draft_id,
@@ -390,29 +404,19 @@ async def draft_state(draft_id: str, picks: List[Dict[str, Any]]) -> Dict[str, A
 
 # -------------------- name-join: UNDRAFTED ↔ rankings.csv --------------------
 def match_players_with_rankings(undrafted_pids: List[str]) -> List[Dict[str, Any]]:
-    """
-    CSV-first merge logic. We set rank_avg and (if missing) proj_ros from AVG,
-    so CSV controls ordering even without explicit projections.
-    """
-    result: List[Dict[str, Any]] = []
+    result: List[Dict[str,Any]] = []
     for pid in undrafted_pids:
         p = PLAYERS_CACHE.get(pid)
         if not p:
             continue
-
         rows = RANK_IDX.get(p.get("name_key"), [])
         if not rows:
             continue
-
-        # Prefer same-position row, else first row.
         chosen = None
         for r in rows:
             if r.get("pos") == p.get("pos"):
-                chosen = r
-                break
-        if not chosen:
-            chosen = rows[0]
-
+                chosen = r; break
+        if not chosen: chosen = rows[0]
         avg = chosen.get("avg")
         proj = chosen.get("proj")
         if avg is not None:
@@ -422,11 +426,6 @@ def match_players_with_rankings(undrafted_pids: List[str]) -> List[Dict[str, Any
                 p["proj_ros"] = max(0.0, 400.0 - float(avg))
         if proj is not None:
             p["proj_ros"] = float(proj)
-
-        # Useful debug for sanity during live drafts:
-        if p.get("name") in {"Saquon Barkley", "Christian McCaffrey"}:
-            print("CSV MERGE ▶", p["name"], "AVG=", p.get("rank_avg"), "POS=", p.get("pos"))
-
         result.append(p)
     return result
 
@@ -450,10 +449,6 @@ def compute_needs(my_ids: List[str], slots: Dict[str,int]) -> Dict[str,float]:
     return needs
 
 def score_available(available: List[Dict[str,Any]], my_ids: List[str], slots: Dict[str,int], pick_number: int) -> List[Dict[str,Any]]:
-    """
-    CSV-first scoring: lower AVG ⇒ higher score (dominant). Projections and ADP
-    provide minor tie-break nudges; roster needs/caps modulate the final score.
-    """
     needs = compute_needs(my_ids, slots)
     pos_counts: Dict[str,int] = {}
     for pid in my_ids:
@@ -466,26 +461,19 @@ def score_available(available: List[Dict[str,Any]], my_ids: List[str], slots: Di
     scored: List[Dict[str,Any]] = []
     for p in available:
         pos = p["pos"]
-
-        # CSV-driven component (dominant)
         ra = p.get("rank_avg")
         csv_score = 0.0
         if isinstance(ra, (int, float)):
             csv_score = 2000.0 / (1.0 + float(ra))
-
-        # Small helpers
         proj = float(p.get("proj_ros") or 0.0)
         adp = p.get("adp")
         adp_discount = (adp_median - adp) if (adp_median is not None and isinstance(adp,(int,float))) else 0.0
-
-        # Needs / cap
         need_boost = needs.get(pos,1.0)
         cur = pos_counts.get(pos,0)
         cap = roster_cap(pos, slots)
         overdrafted = max(0, cur - cap)
         cap_penalty = 0.85 ** overdrafted
 
-        # Final blend — CSV dominates
         score = (csv_score * 1.00) + (proj * 0.20) + (adp_discount * 0.05)
         score *= (0.85 + 0.30 * need_boost)
         score *= cap_penalty
@@ -498,22 +486,16 @@ def score_available(available: List[Dict[str,Any]], my_ids: List[str], slots: Di
             "score": round(score,3),
             "explain": f"csv={round(csv_score,1)} (AVG={ra}), proj={proj}, need {need_boost:.2f}, cap {cur}/{cap}, pick {pick_number}"
         })
-
     scored.sort(key=lambda x: x["score"], reverse=True)
     return scored
 
 # -------------------- request models --------------------
 class RecommendReq(BaseModel):
-    # identify draft
     draft_url: Optional[str] = None
     league_id: Optional[str] = None
-
-    # identify team
-    roster_id: Optional[int] = None        # Sleeper roster_id
-    team_slot: Optional[int] = None        # draft position 1..N (we'll map it)
-    team_name: Optional[str] = None        # username/display_name/team_name (requires league_id)
-
-    # pick context
+    roster_id: Optional[int] = None
+    team_slot: Optional[int] = None
+    team_name: Optional[str] = None
     pick_number: int
     season: int = 2025
     roster_slots: Optional[Dict[str,int]] = None
@@ -528,7 +510,7 @@ class InspectReq(BaseModel):
 
 class GuessRosterReq(BaseModel):
     draft_url: str
-    player_names: List[str]   # e.g., ["Saquon Barkley","Amon-Ra St. Brown"]
+    player_names: List[str]
 
 # -------------------- lifecycle --------------------
 @app.on_event("startup")
@@ -638,22 +620,31 @@ async def _resolve_draft_and_team(
 
     # 1) explicit roster_id
     if isinstance(rid := roster_id, int):
-        eff_rid, eff_slot = map_slot_or_roster_id(rid, state.get("slot_to_roster"), by_roster, state.get("total_teams") or 12)
+        normalized = state.get("slot_to_roster_normalized") or []
+        if not normalized:
+            normalized = normalize_slot_to_roster(state.get("slot_to_roster"), state.get("total_teams") or 12)
+        if rid in by_roster:
+            eff_rid, eff_slot = rid, None
+        else:
+            eff_rid, eff_slot = rid, None  # accept as-is; may be pre-draft
     # 2) team_slot mapping
     elif isinstance(team_slot, int):
-        eff_rid, eff_slot = map_slot_or_roster_id(team_slot, state.get("slot_to_roster"), by_roster, state.get("total_teams") or 12)
+        normalized = state.get("slot_to_roster_normalized") or []
+        if not normalized:
+            normalized = normalize_slot_to_roster(state.get("slot_to_roster"), state.get("total_teams") or 12)
+        idx = team_slot - 1
+        if 0 <= idx < len(normalized) and isinstance(normalized[idx], int):
+            eff_rid = int(normalized[idx])
+            eff_slot = team_slot
     # 3) team_name + league_id
     elif team_name and league_id:
         maybe = await resolve_roster_id_from_team_name(league_id, team_name)
         if maybe is not None:
-            eff_rid, eff_slot = map_slot_or_roster_id(maybe, state.get("slot_to_roster"), by_roster, state.get("total_teams") or 12)
+            eff_rid, eff_slot = maybe, None
 
-    # 4) still nothing? best-effort: default to first observed roster
+    # 4) still nothing? default
     if eff_rid is None:
-        if by_roster:
-            eff_rid = sorted(by_roster.keys())[0]
-        else:
-            eff_rid = 1
+        eff_rid = sorted(by_roster.keys())[0] if by_roster else 1
 
     return draft_id, eff_rid, eff_slot
 
@@ -663,7 +654,6 @@ async def inspect_draft(body: InspectReq, x_api_key: Optional[str] = Header(None
     await load_players_if_needed()
     ensure_rankings_loaded()
 
-    # figure out draft_id (draft_url or league_id) to fetch picks FIRST
     if body.draft_url:
         draft_id, picks_url = normalize_draft_picks_url(body.draft_url)
     elif body.league_id:
@@ -677,7 +667,6 @@ async def inspect_draft(body: InspectReq, x_api_key: Optional[str] = Header(None
     drafted_ids, by_roster = parse_drafted_from_picks(picks)
     state = await draft_state(draft_id, picks)
 
-    # resolve team
     _, eff_rid, eff_slot = await _resolve_draft_and_team(
         draft_url=body.draft_url, league_id=body.league_id,
         roster_id=body.roster_id, team_slot=body.team_slot, team_name=body.team_name,
@@ -733,7 +722,6 @@ async def recommend_live(body: RecommendReq, x_api_key: Optional[str] = Header(N
     await load_players_if_needed()
     ensure_rankings_loaded()
 
-    # figure out draft_id + picks_url
     if body.draft_url:
         draft_id, picks_url = normalize_draft_picks_url(body.draft_url)
     elif body.league_id:
