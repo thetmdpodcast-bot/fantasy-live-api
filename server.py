@@ -519,9 +519,9 @@ async def startup():
     ensure_rankings_loaded(force=True)
 
 @app.get("/warmup")
-def warmup():
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(load_players_if_needed())
+async def warmup():
+    # simply await; do NOT create/run loops manually
+    await load_players_if_needed()
     ensure_rankings_loaded(force=True)
     return {
         "ok": True,
