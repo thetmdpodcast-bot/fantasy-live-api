@@ -1,15 +1,8 @@
 # server.py
 # Fantasy Live Draft API
 # - FastAPI service that merges a local rankings.csv with Sleeper live draft data
-# - Robust to Sleeper hiccups: all main endpoints always return HTTP 200 with a "status" field
+# - Robust to Sleeper hiccups: protected endpoints always return HTTP 200 with a "status" field
 # - No pandas; pure stdlib + httpx
-# - Endpoints:
-#     GET  /health         (open)
-#     GET  /warmup         (open)
-#     GET  /echo_auth      (protected) echo test for x-api-key pipeline
-#     POST /inspect_draft  (protected) examine a draft; resolve team/roster; summarize state
-#     POST /guess_roster   (protected) guess roster_id from a few drafted player names
-#     POST /recommend_live (protected) live recommendations using rankings.csv & undrafted pool
 
 import csv
 import math
@@ -18,6 +11,7 @@ import random
 import re
 import time
 import asyncio
+from functools import wraps
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
@@ -27,7 +21,7 @@ from pydantic import BaseModel
 
 # -------------------- Configuration --------------------
 
-API_KEY = os.getenv("API_KEY")
+API_KEY = os.getenv("API_KEY")  # require x-api-key for protected routes if set
 RANKINGS_CSV_PATH = os.getenv("RANKINGS_CSV_PATH", "rankings.csv")
 PLAYERS_TTL_SEC = int(os.getenv("PLAYERS_TTL_SEC", "1800"))
 
@@ -47,9 +41,8 @@ _rankings_cache: Dict[str, Any] = {
 }
 
 _players_cache: Dict[str, Any] = {
-    # Not loading Sleeper's whole player universe (it's huge).
-    # We'll track only counts & TTL semantics for /health UI parity.
-    "raw": 0,     # pretend "raw" == kept; we don't fetch the 11k dump here.
+    # We mirror counts for health; we don't pull all Sleeper players (huge).
+    "raw": 0,
     "kept": 0,
     "ts": 0,
 }
@@ -110,8 +103,7 @@ def _safe_float(x: str) -> Optional[float]:
         return None
 
 def _load_rankings(force: bool = False):
-    """Load rankings.csv into cache; shape is flexible but we expect columns like:
-       id (Sleeper player_id), name, team, pos, rank_avg (or avg/adp/score/proj_ros etc.)"""
+    """Load rankings.csv into cache; expect at least columns: id, name. Optional: pos, rank_avg, score, proj_ros."""
     try:
         mtime = os.path.getmtime(RANKINGS_CSV_PATH)
     except Exception:
@@ -129,12 +121,10 @@ def _load_rankings(force: bool = False):
         with open(RANKINGS_CSV_PATH, newline="", encoding="utf-8") as f:
             reader = csv.DictReader(f)
             for r in reader:
-                # Normalize keys we often rely on
-                r = {k.strip(): v.strip() for k, v in r.items()}
+                r = {k.strip(): (v.strip() if isinstance(v, str) else v) for k, v in r.items()}
                 pid = str(r.get("id") or r.get("player_id") or "").strip()
                 name = r.get("name") or r.get("player") or ""
-                pos = r.get("pos") or r.get("position") or ""
-                # numbers we might use
+                r["pos"] = (r.get("pos") or r.get("position") or "").upper()
                 r["rank_avg"] = _safe_float(r.get("rank_avg") or r.get("avg") or r.get("adp"))
                 r["score"] = _safe_float(r.get("score"))
                 r["proj_ros"] = _safe_float(r.get("proj_ros"))
@@ -148,23 +138,14 @@ def _load_rankings(force: bool = False):
                 key = _normalize_name(name)
                 by_name.setdefault(key, []).append(pid)
 
-        _rankings_cache["rows"] = rows
-        _rankings_cache["by_id"] = by_id
-        _rankings_cache["by_name"] = by_name
-        _rankings_cache["warn"] = warn
-        _rankings_cache["ts"] = _now()
-
-        # mirror into players cache counts for /health parity
-        _players_cache["raw"] = len(rows)
-        _players_cache["kept"] = len(rows)
-        _players_cache["ts"] = _now()
+        _rankings_cache.update({"rows": rows, "by_id": by_id, "by_name": by_name, "warn": warn, "ts": _now()})
+        _players_cache.update({"raw": len(rows), "kept": len(rows), "ts": _now()})
 
     except FileNotFoundError:
-        _rankings_cache["rows"] = []
-        _rankings_cache["by_id"] = {}
-        _rankings_cache["by_name"] = {}
-        _rankings_cache["warn"] = [f"rankings file not found: {RANKINGS_CSV_PATH}"]
-        _rankings_cache["ts"] = _now()
+        _rankings_cache.update({
+            "rows": [], "by_id": {}, "by_name": {},
+            "warn": [f"rankings file not found: {RANKINGS_CSV_PATH}"], "ts": _now()
+        })
 
 # -------------------- Sleeper helpers --------------------
 
@@ -181,9 +162,8 @@ async def _draft_id_from_league(league_id: str) -> str:
     drafts = await _get_json(f"{SLEEPER}/league/{league_id}/drafts")
     if not drafts:
         raise HTTPException(status_code=404, detail="No drafts for league")
-    # Choose in_progress if available, else most recent
     def keyer(d: Dict[str, Any]):
-        status = d.get("status") or d.get("state") or ""
+        status = (d.get("status") or d.get("state") or "")
         updated = d.get("updated_at") or d.get("created") or 0
         return (status == "in_progress", updated)
     best = sorted(drafts, key=keyer, reverse=True)[0]
@@ -193,29 +173,22 @@ async def _draft_id_from_league(league_id: str) -> str:
     return did
 
 def _overall_pick_no(p: Dict[str, Any]) -> Optional[int]:
-    # Sleeper returns either "pick_no" or "pick" for overall
-    if "pick_no" in p and isinstance(p["pick_no"], int):
+    if isinstance(p.get("pick_no"), int):
         return p["pick_no"]
-    if "pick" in p and isinstance(p["pick"], int):
+    if isinstance(p.get("pick"), int):
         return p["pick"]
-    # try compute from round + draft_slot if present
-    rnd = p.get("round"); slot = p.get("draft_slot") or p.get("slot")
-    if isinstance(rnd, int) and isinstance(slot, int):
-        # This assumes normal snake and 1-indexed slot; round-based calc is messy for reverse rounds
-        # We'll return None rather than guessing wrong.
-        return None
+    # if round + draft_slot exist, computing overall can be snake-sensitive; skip
     return None
 
 def _slot_from_pick(overall: int, total_teams: int) -> int:
-    # 1-indexed slot from overall pick if round 1
     if overall <= 0 or total_teams <= 0:
         return 0
-    # In round 1, slot == ((overall-1) % total_teams) + 1
     return ((overall - 1) % total_teams) + 1
 
-# -------------------- Response wrappers --------------------
+# -------------------- Response wrapper --------------------
 
 def always_200(fn):
+    @wraps(fn)  # preserve FastAPI signature (fixes 422 "query/args/kwargs" issue)
     async def _inner(*args, **kwargs):
         try:
             return await fn(*args, **kwargs)
@@ -255,7 +228,7 @@ class RecommendLiveRequest(BaseModel):
     roster_slots: Optional[Dict[str, int]] = None
     limit: Optional[int] = 10
 
-# -------------------- Endpoints: health / warmup / echo_auth --------------------
+# -------------------- Open endpoints: health / warmup / echo_auth --------------------
 
 @app.get("/health")
 async def health():
@@ -263,7 +236,6 @@ async def health():
     ttl_left = None
     if _players_cache["ts"]:
         ttl_left = max(0, PLAYERS_TTL_SEC - (_now() - _players_cache["ts"])) if PLAYERS_TTL_SEC else None
-
     return {
         "ok": True,
         "players_cached": _players_cache["kept"],
@@ -305,7 +277,6 @@ async def echo_auth(x_api_key: Optional[str] = Header(None)):
 # -------------------- Core helpers for draft analysis --------------------
 
 async def _resolve_draft_inputs(body: InspectDraftRequest) -> Tuple[str, Dict[str, Any], List[Dict[str, Any]]]:
-    """Return (draft_id, draft_meta, picks[])"""
     if body.draft_url:
         draft_id = _extract_draft_id(body.draft_url)
     elif body.league_id:
@@ -318,14 +289,12 @@ async def _resolve_draft_inputs(body: InspectDraftRequest) -> Tuple[str, Dict[st
     return draft_id, meta, picks
 
 def _slot_to_roster_from_picks(picks: List[Dict[str, Any]], total_teams: int) -> Dict[int, int]:
-    """Compute slot->roster_id using round-1 evidence."""
     slot_to_roster: Dict[int, int] = {}
     for p in picks:
         overall = _overall_pick_no(p)
         if overall is None:
             continue
-        # Only take round-1 picks to map slot consistently
-        if overall <= total_teams:
+        if overall <= total_teams:  # only use round-1
             slot = _slot_from_pick(overall, total_teams)
             rid = p.get("roster_id")
             if isinstance(slot, int) and slot >= 1 and rid:
@@ -335,7 +304,6 @@ def _slot_to_roster_from_picks(picks: List[Dict[str, Any]], total_teams: int) ->
     return slot_to_roster
 
 def _my_team_from_roster(picks: List[Dict[str, Any]], roster_id: int) -> List[str]:
-    """Return list of player_ids drafted by a roster."""
     ids: List[str] = []
     for p in picks:
         if p.get("roster_id") == roster_id:
@@ -353,24 +321,11 @@ def _counts_by_pos(player_ids: List[str]) -> Dict[str, int]:
         pos = (row.get("pos") or "").upper()
         if pos in ("QB","RB","WR","TE"):
             cnt[pos] = cnt.get(pos, 0) + 1
-    # quick derived FLEX count (anything RB/WR/TE above mins can be considered pool)
     cnt["FLEX"] = max(0, cnt["RB"] + cnt["WR"] + cnt["TE"])
     return cnt
 
 def _default_roster_caps() -> Dict[str,int]:
     return {"QB":1,"RB":2,"WR":2,"TE":1,"FLEX":2}
-
-def _score_row(row: Dict[str, Any], needed: Dict[str,float]) -> float:
-    """Heuristic score combining rank and positional need."""
-    # Lower rank_avg is better; translate to higher score
-    rank = row.get("rank_avg")
-    base = 0.0
-    if isinstance(rank, (int,float)):
-        base = max(0.0, 300.0 - float(rank))  # arbitrary, but consistent
-
-    pos = (row.get("pos") or "").upper()
-    need_w = needed.get(pos, 1.0)
-    return base * need_w
 
 def _need_weights(caps: Dict[str,int], have: Dict[str,int]) -> Dict[str,float]:
     weights: Dict[str,float] = {}
@@ -379,9 +334,15 @@ def _need_weights(caps: Dict[str,int], have: Dict[str,int]) -> Dict[str,float]:
             weights[pos] = 0.8
             continue
         left = max(0, cap - have.get(pos, 0))
-        # 1.3 when empty, down to ~0.8 when filled
-        weights[pos] = 0.8 + (0.5 * (left / cap))
+        weights[pos] = 0.8 + (0.5 * (left / cap))  # 1.3 empty -> ~0.8 filled
     return weights
+
+def _score_row(row: Dict[str, Any], needed: Dict[str,float]) -> float:
+    rank = row.get("rank_avg")
+    base = max(0.0, 300.0 - float(rank)) if isinstance(rank, (int,float)) else 0.0
+    pos = (row.get("pos") or "").upper()
+    need_w = needed.get(pos, 1.0)
+    return base * need_w
 
 # -------------------- Protected endpoints --------------------
 
@@ -409,10 +370,8 @@ async def inspect_draft(body: InspectDraftRequest, x_api_key: Optional[str] = He
         effective_roster_id = slot_to_roster_raw[body.team_slot]
         effective_team_slot = body.team_slot
 
-    # Basic stats
     drafted_ids_all = [str(p.get("player_id")) for p in picks if p.get("player_id")]
-    drafted_count = len(drafted_ids_all)
-    undrafted_count = max(0, len(_rankings_cache["rows"]) - drafted_count)
+    undrafted_count = max(0, len(_rankings_cache["rows"]) - len(drafted_ids_all))
 
     my_team_ids: List[str] = []
     if effective_roster_id:
@@ -428,7 +387,7 @@ async def inspect_draft(body: InspectDraftRequest, x_api_key: Optional[str] = He
         "effective_roster_id": effective_roster_id,
         "effective_team_slot": effective_team_slot,
         "my_team": [{"player_id": pid, **(_rankings_cache["by_id"].get(pid) or {})} for pid in my_team_ids],
-        "drafted_count": drafted_count,
+        "drafted_count": len(drafted_ids_all),
         "my_team_count": len(my_team_ids),
         "undrafted_count": undrafted_count,
         "csv_matched_count": len(_rankings_cache["rows"]),
@@ -445,13 +404,11 @@ async def guess_roster(body: GuessRosterRequest, x_api_key: Optional[str] = Head
     draft_id = _extract_draft_id(body.draft_url)
     picks = await _get_draft_picks(draft_id)
 
-    # Map provided names -> ranking pids (normalized)
     provided_ids: List[str] = []
     for n in body.player_names:
         key = _normalize_name(n)
         provided_ids.extend(_rankings_cache["by_name"].get(key, []))
 
-    # Tally matches per roster
     tally: Dict[int,int] = {}
     roster_players: Dict[int,List[str]] = {}
     for p in picks:
@@ -462,15 +419,13 @@ async def guess_roster(body: GuessRosterRequest, x_api_key: Optional[str] = Head
         if pid in provided_ids:
             tally[rid] = tally.get(rid, 0) + 1
             roster_players.setdefault(rid, [])
-            # store readable name if we have it
             nm = (_rankings_cache["by_id"].get(pid) or {}).get("name") or pid
             roster_players[rid].append(nm)
 
-    candidates = []
-    for rid, matches in sorted(tally.items(), key=lambda kv: kv[1], reverse=True):
-        candidates.append({"roster_id": rid, "matches": matches, "players": roster_players.get(rid, [])})
-
+    candidates = [{"roster_id": rid, "matches": m, "players": roster_players.get(rid, [])}
+                  for rid, m in sorted(tally.items(), key=lambda kv: kv[1], reverse=True)]
     guessed = candidates[0]["roster_id"] if candidates else None
+
     return {
         "status": "ok",
         "draft_id": draft_id,
@@ -509,7 +464,6 @@ async def recommend_live(body: RecommendLiveRequest, x_api_key: Optional[str] = 
     drafted_ids_all = {str(p.get("player_id")) for p in picks if p.get("player_id")}
     undrafted = [r for r in _rankings_cache["rows"] if str(r.get("id") or r.get("player_id") or "") not in drafted_ids_all]
 
-    # Need weights by comparing our roster to caps
     caps = body.roster_slots or _default_roster_caps()
     have = _counts_by_pos(my_team_ids)
     need_w = _need_weights(caps, have)
@@ -520,7 +474,6 @@ async def recommend_live(body: RecommendLiveRequest, x_api_key: Optional[str] = 
         if not pid:
             continue
         score = _score_row(r, need_w)
-        exp = f"rank={r.get('rank_avg')}, need_w={need_w.get((r.get('pos') or '').upper(),1.0):.2f}"
         item = {
             "id": pid,
             "name": r.get("name"),
@@ -529,7 +482,7 @@ async def recommend_live(body: RecommendLiveRequest, x_api_key: Optional[str] = 
             "rank_avg": r.get("rank_avg"),
             "proj_ros": r.get("proj_ros"),
             "score": round(score, 3),
-            "explain": exp
+            "explain": f"rank={r.get('rank_avg')}, need_w={need_w.get((r.get('pos') or '').upper(),1.0):.2f}"
         }
         scored.append(item)
 
