@@ -1,13 +1,5 @@
 # server.py
 # Fantasy Live Draft API — Sleeper live draft + rankings.csv
-# Public:   /health, /warmup
-# Secured:  /inspect_draft, /guess_roster, /recommend_live
-#
-# ENV:
-#   API_KEY               -> secret to require on secured endpoints (do NOT hardcode)
-#   RANKINGS_CSV_PATH     -> path to rankings.csv (default: rankings.csv)
-#   PLAYERS_TTL_SEC       -> cache TTL for Sleeper players (default: 1080)
-#   PORT                  -> local dev port for uvicorn
 
 from __future__ import annotations
 
@@ -21,6 +13,7 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
+from httpx import HTTPStatusError, RequestError
 from fastapi import Body, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -28,9 +21,9 @@ from starlette.middleware.base import RequestResponseEndpoint
 from starlette.responses import JSONResponse
 
 # ---------------------------
-# Config & constants
+# Config
 # ---------------------------
-API_KEY = os.getenv("API_KEY")  # if set, require it for secured routes
+API_KEY = (os.getenv("API_KEY") or "").strip()                 # required on secured routes
 RANKINGS_CSV_PATH = os.getenv("RANKINGS_CSV_PATH", "rankings.csv")
 PLAYERS_TTL_SEC = int(os.getenv("PLAYERS_TTL_SEC", "1080"))
 
@@ -46,7 +39,8 @@ DEFAULT_LIMIT = 10
 # ---------------------------
 # App
 # ---------------------------
-app = FastAPI(title="Fantasy Live Draft API", version="1.0.3")
+app = FastAPI(title="Fantasy Live Draft API", version="1.0.4")
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -98,7 +92,7 @@ def extract_draft_id(s: str) -> Optional[str]:
     return m.group(1) if m else None
 
 async def http_get_json(url: str, *, tolerate_404=False) -> Any:
-    """GET with friendly headers + one retry. 404 can be treated as empty list."""
+    """GET JSON with short retry; logs upstream status. 404 can be empty list."""
     for attempt in (1, 2):
         try:
             async with httpx.AsyncClient(
@@ -114,13 +108,13 @@ async def http_get_json(url: str, *, tolerate_404=False) -> Any:
                 return r.json()
             except Exception:
                 return r.text
-        except httpx.HTTPStatusError as e:
+        except HTTPStatusError as e:
             body = e.response.text[:400]
             print(f"[sleeper] {url} -> {e.response.status_code} {body}")
             if attempt == 2:
                 raise
             await asyncio.sleep(0.35 + random.random() * 0.4)
-        except httpx.RequestError as e:
+        except RequestError as e:
             print(f"[sleeper] network {url} -> {e}")
             if attempt == 2:
                 raise
@@ -147,7 +141,7 @@ PROTECTED_PATHS = {"/inspect_draft", "/guess_roster", "/recommend_live"}
 def provided_api_key(request: Request) -> Optional[str]:
     key = request.headers.get("x-api-key")
     if key:
-        return key
+        return key.strip()
     auth = request.headers.get("authorization", "")
     if auth.lower().startswith("bearer "):
         return auth.split(None, 1)[1].strip()
@@ -156,8 +150,8 @@ def provided_api_key(request: Request) -> Optional[str]:
 @app.middleware("http")
 async def auth_and_log_mw(request: Request, call_next: RequestResponseEndpoint):
     if request.url.path in PROTECTED_PATHS:
-        got = provided_api_key(request) or ""
-        exp = API_KEY or ""
+        got = (provided_api_key(request) or "")
+        exp = API_KEY
         got_h = hashlib.sha256(got.encode()).hexdigest()[:8] if got else "-"
         exp_h = hashlib.sha256(exp.encode()).hexdigest()[:8] if exp else "-"
         print(f"[auth] {request.url.path} got={bool(got)} got_sha8={got_h} exp_set={bool(exp)} exp_sha8={exp_h} match={got == exp}")
@@ -169,7 +163,6 @@ async def auth_and_log_mw(request: Request, call_next: RequestResponseEndpoint):
 # Loaders
 # ---------------------------
 async def ensure_players_loaded() -> Tuple[int, int]:
-    """Returns (raw_count, kept_count)."""
     global PLAYERS_RAW, PLAYERS_KEEP, PLAYERS_BY_NAME, PLAYERS_FETCHED_AT
     if PLAYERS_FETCHED_AT and now_ts() - PLAYERS_FETCHED_AT < PLAYERS_TTL_SEC:
         return len(PLAYERS_RAW), len(PLAYERS_KEEP)
@@ -201,7 +194,6 @@ def map_name_to_pid(name: str) -> Optional[str]:
     return PLAYERS_BY_NAME.get(norm_name(name))
 
 def open_rankings() -> Tuple[int, List[str]]:
-    """Load rankings.csv into RANKINGS_ROWS and map to Sleeper IDs."""
     global RANKINGS_ROWS, RANKINGS_WARNINGS, RANKINGS_LAST_MERGE
     RANKINGS_ROWS = []
     RANKINGS_WARNINGS = []
@@ -336,7 +328,7 @@ class RecommendLiveRequest(BaseModel):
     limit: int = DEFAULT_LIMIT
 
 # ---------------------------
-# Routes — public
+# Public routes
 # ---------------------------
 @app.get("/health")
 async def health():
@@ -360,8 +352,20 @@ async def health():
 async def warmup_route():
     return await warmup()
 
+# Debug helper: verify key presence/match from Builder
+@app.get("/echo_auth")
+async def echo_auth(request: Request):
+    got = provided_api_key(request) or ""
+    return {
+        "ok": True,
+        "got_present": bool(got),
+        "got_len": len(got),
+        "exp_present": bool(API_KEY),
+        "match": bool(API_KEY and got == API_KEY),
+    }
+
 # ---------------------------
-# Routes — secured
+# Secured routes
 # ---------------------------
 @app.post("/inspect_draft")
 async def inspect_draft(req: InspectDraftRequest, request: Request):
@@ -372,13 +376,20 @@ async def inspect_draft(req: InspectDraftRequest, request: Request):
     if not RANKINGS_ROWS:
         open_rankings()
 
-    draft_obj, picks = await fetch_draft_and_picks(req.draft_url, req.league_id)
+    try:
+        draft_obj, picks = await fetch_draft_and_picks(req.draft_url, req.league_id)
+    except HTTPStatusError as e:
+        raise HTTPException(status_code=502, detail={"upstream": "sleeper", "status": e.response.status_code, "url": str(e.request.url), "body": e.response.text[:200]})
+    except RequestError as e:
+        raise HTTPException(status_code=502, detail={"upstream": "sleeper", "error": str(e)})
 
     observed: List[int] = []
     for pk in picks:
         rid = pk.get("roster_id")
-        if rid is not None and int(rid) not in observed:
-            observed.append(int(rid))
+        if rid is not None:
+            ir = int(rid)
+            if ir not in observed:
+                observed.append(ir)
 
     effective_roster_id = req.roster_id
     my_team: List[Dict[str, Any]] = []
@@ -420,7 +431,12 @@ async def guess_roster(req: GuessRosterRequest, request: Request):
         raise HTTPException(status_code=401, detail="Invalid API key")
 
     await ensure_players_loaded()
-    draft_obj, picks = await fetch_draft_and_picks(req.draft_url, None)
+    try:
+        draft_obj, picks = await fetch_draft_and_picks(req.draft_url, None)
+    except HTTPStatusError as e:
+        raise HTTPException(status_code=502, detail={"upstream": "sleeper", "status": e.response.status_code, "url": str(e.request.url), "body": e.response.text[:200]})
+    except RequestError as e:
+        raise HTTPException(status_code=502, detail={"upstream": "sleeper", "error": str(e)})
 
     want_pids = {pid for nm in req.player_names if (pid := map_name_to_pid(nm))}
     by_roster: Dict[int, set] = {}
@@ -458,15 +474,19 @@ async def recommend_live(req: RecommendLiveRequest, request: Request):
     if not RANKINGS_ROWS:
         open_rankings()
 
-    draft_obj, picks = await fetch_draft_and_picks(req.draft_url, req.league_id)
-    drafted = drafted_set(picks)
+    try:
+        draft_obj, picks = await fetch_draft_and_picks(req.draft_url, req.league_id)
+    except HTTPStatusError as e:
+        raise HTTPException(status_code=502, detail={"upstream": "sleeper", "status": e.response.status_code, "url": str(e.request.url), "body": e.response.text[:200]})
+    except RequestError as e:
+        raise HTTPException(status_code=502, detail={"upstream": "sleeper", "error": str(e)})
 
+    drafted = drafted_set(picks)
     effective_roster_id = req.roster_id
     my_team: List[Dict[str, Any]] = []
     if effective_roster_id:
         my_team = roster_team(picks, effective_roster_id)
 
-    # positional need weights
     caps = req.roster_slots or DEFAULT_SLOTS
     counts = count_by_pos(my_team)
     needs_weight: Dict[str, float] = {}
