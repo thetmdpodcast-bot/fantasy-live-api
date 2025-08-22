@@ -37,6 +37,14 @@ NFL_TEAMS = {
 
 app = FastAPI(title="Fantasy Live Draft (rankings.csv + Sleeper)")
 
+from fastapi.middleware.cors import CORSMiddleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 # -------------------- caches --------------------
 PLAYERS_CACHE: Dict[str, Dict[str, Any]] = {}
 PLAYERS_LOADED_AT: float = 0.0
@@ -412,6 +420,10 @@ def match_players_with_rankings(undrafted_pids: List[str]) -> List[Dict[str, Any
 # -------------------- scoring --------------------
 NEED_WEIGHTS = {"QB":1.1, "RB":1.45, "WR":1.45, "TE":1.25}
 
+
+DEFAULT_SLOTS = {"QB": 1, "RB": 2, "WR": 2, "TE": 1, "FLEX": 2}
+DEFAULT_LIMIT = 10
+
 def roster_cap(pos: str, slots: Dict[str,int]) -> int:
     if pos in {"RB","WR"}: return slots.get(pos,0) + slots.get("FLEX",0) + 2
     if pos in {"TE","QB"}: return slots.get(pos,0) + 1
@@ -428,7 +440,7 @@ def compute_needs(my_ids: List[str], slots: Dict[str,int]) -> Dict[str,float]:
         needs[pos] = base if gap>0 else base*0.35
     return needs
 
-def score_available(available: List[Dict[str,Any]], my_ids: List[str], slots: Dict[str,int], pick_number: int) -> List[Dict[str,Any]]:
+def score_available(available: List[Dict[str,Any]], my_ids: List[str], slots: Dict[str,int], pick_number: Optional[int] = None) -> List[Dict[str,Any]]:
     needs = compute_needs(my_ids, slots)
     pos_counts: Dict[str,int] = {}
     for pid in my_ids:
@@ -479,7 +491,7 @@ class RecommendReq(BaseModel):
     roster_id: Optional[int] = None
     team_slot: Optional[int] = None
     team_name: Optional[str] = None
-    pick_number: int
+    pick_number: Optional[int] = None
     season: int = 2025
     roster_slots: Optional[Dict[str,int]] = None
     limit: int = 10
@@ -756,9 +768,9 @@ async def recommend_live(body: RecommendReq, x_api_key: Optional[str] = Header(N
             "ts": int(time.time())
         }
 
-    slots = body.roster_slots or {"QB":1,"RB":2,"WR":2,"TE":1,"FLEX":2}
+    slots = body.roster_slots or DEFAULT_SLOTS
     ranked = score_available(available_enriched, my_ids, slots, body.pick_number)
-    limit = max(3, body.limit)
+    limit = max(3, body.limit or DEFAULT_LIMIT)
     topn = ranked[:limit]
 
     return {
@@ -772,5 +784,22 @@ async def recommend_live(body: RecommendReq, x_api_key: Optional[str] = Header(N
         "effective_roster_id": eff_rid,
         "drafted_count": len(drafted_ids),
         "my_team_count": len(my_ids),
+        "ts": int(time.time())
+    }
+
+
+@app.get("/warmup")
+async def warmup():
+    # Public: prime caches so first real call is fast
+    await load_players_if_needed(force=True)
+    ensure_rankings_loaded(force=True)
+    return {
+        "ok": True,
+        "players_cached": len(PLAYERS_CACHE),
+        "players_raw": PLAYERS_RAW_COUNT,
+        "players_kept": PLAYERS_KEPT_COUNT,
+        "players_ttl_sec": PLAYERS_TTL_SEC,
+        "rankings_rows": RANKINGS_ROWS,
+        "rankings_warnings": RANKINGS_WARNINGS,
         "ts": int(time.time())
     }
