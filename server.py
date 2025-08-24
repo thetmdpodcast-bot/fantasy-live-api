@@ -1,67 +1,77 @@
 # server.py
 from __future__ import annotations
-import os, re, csv, json, time, math, asyncio, random
+import os, re, csv, json, time, math
 from typing import Any, Dict, List, Optional, Tuple
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 import httpx
 
-APP_VERSION = "1.0.8"
+APP_VERSION = "1.0.7"
 
 app = FastAPI(title="Fantasy Live Draft API")
 
-# ==== auth ====
+# ==== auth ==============================================================
 EXPECTED_API_KEY = os.getenv("API_KEY", "")
-
 def require_api_key(x_api_key: Optional[str]):
     if not EXPECTED_API_KEY:
         return  # auth disabled
     if not x_api_key or x_api_key != EXPECTED_API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
 
-# ==== Sleeper helpers ====
+# ==== tiny Sleeper helpers =============================================
 SLEEPER = "https://api.sleeper.app/v1"
 
-_DEFAULT_HEADERS = {
-    "User-Agent": "fantasy-live/1.0 (+onrender)",
-    "Accept": "application/json",
-    "Cache-Control": "no-cache",
-}
-
-async def _get_json(url: str, *, timeout=20) -> Tuple[int, Any]:
-    # add a small cache-buster so CF doesn't hand us a stale edge
-    sep = "&" if "?" in url else "?"
-    url = f"{url}{sep}_cb={int(time.time()*1000)}"
-    async with httpx.AsyncClient(timeout=timeout, http2=False, headers=_DEFAULT_HEADERS) as cli:
+async def http_get_json(url: str) -> Any:
+    async with httpx.AsyncClient(timeout=20) as cli:
         r = await cli.get(url)
-        status = r.status_code
-        try:
-            data = r.json()
-        except Exception:
-            data = None
-        return status, data
+        r.raise_for_status()
+        return r.json()
 
-async def _try_many(urls: List[str], *, attempts=3, base_delay=0.35) -> Tuple[int, Any, List[str]]:
-    """Try a list of URLs with tiny backoff. Return (status, data, debug)."""
-    dbg: List[str] = []
-    last_status, last_data = 0, None
-    for u in urls:
-        for i in range(attempts):
-            s, d = await _get_json(u)
-            dbg.append(f"GET {u} -> {s}")
-            if s == 200 and d is not None:
-                return s, d, dbg
-            # small backoff / jitter
-            await asyncio.sleep(base_delay + random.random() * 0.25)
-        last_status, last_data = s, d
-    return last_status, last_data, dbg
+async def _draft_id_from_url(draft_url: str) -> str:
+    did = draft_url.strip().rstrip("/").split("/")[-1]
+    if not did.isdigit():
+        raise HTTPException(status_code=400, detail="Invalid draft_url")
+    return did
 
-# ==== rankings cache ====
+async def _picks_for_draft_id(draft_id: str) -> List[Dict[str, Any]]:
+    url = f"{SLEEPER}/draft/{draft_id}/picks"
+    try:
+        data = await http_get_json(url)
+    except Exception:
+        data = []
+    return data or []
+
+# Pull a display player name from a Sleeper pick object
+def _pick_name(p: Dict[str, Any]) -> Optional[str]:
+    if not isinstance(p, dict):
+        return None
+    md = p.get("metadata") or {}
+    if isinstance(md, dict):
+        # common fast path
+        n = md.get("player_name")
+        if n:
+            return n
+        # fallback build
+        first = md.get("first_name") or ""
+        last  = md.get("last_name") or ""
+        if first or last:
+            return (first + " " + last).strip()
+    # final fallback
+    return p.get("player_name")
+
+def _names_from_picks(picks: List[Dict[str, Any]]) -> List[str]:
+    out: List[str] = []
+    for p in picks:
+        n = _pick_name(p)
+        if n:
+            out.append(n)
+    return out
+
+# ==== rankings cache ====================================================
 _rankings_rows: List[Dict[str, Any]] = []
 _rankings_index_by_norm: Dict[str, Dict[str, Any]] = {}
 _last_rankings_merge_ts: Optional[int] = None
 
-# Emergency list if CSV + joins fail (never blank UI)
 _EMERGENCY_TOP: List[Dict[str, Any]] = [
     {"name":"Josh Allen","team":"BUF","pos":"QB","rank_avg":1.0},
     {"name":"Patrick Mahomes","team":"KC","pos":"QB","rank_avg":2.0},
@@ -74,66 +84,64 @@ _EMERGENCY_TOP: List[Dict[str, Any]] = [
 _norm_rx = re.compile(r"[^a-z0-9]+")
 
 def norm(s: str) -> str:
-    return _norm_rx.sub("", s.lower().strip()) if isinstance(s, str) else ""
+    return _norm_rx.sub("", s.lower().strip()) if s else ""
 
-def _load_rankings_from_csv() -> Tuple[List[Dict[str, Any]], Dict[str, Dict[str, Any]]]:
+def _s(v: Any) -> str:
+    """coerce any CSV value to a trimmed string (handles lists/None)"""
+    if v is None:
+        return ""
+    if isinstance(v, str):
+        return v.strip()
+    if isinstance(v, list):
+        return ", ".join(str(x) for x in v).strip()
+    return str(v).strip()
+
+def warm_rankings() -> None:
     """
-    Expect a local rankings.csv with at least columns:
-    name, team, pos, rank (or rank_avg)
+    Load rankings.csv with forgiving headers:
+      - allows 'name', 'player', 'Player'
+      - rank from 'rank_avg', 'rank', or 'avg'
+      - pos from 'pos' or 'position'
     """
+    global _rankings_rows, _rankings_index_by_norm, _last_rankings_merge_ts
     path = os.getenv("RANKINGS_CSV", "rankings.csv")
     rows: List[Dict[str, Any]] = []
     index: Dict[str, Dict[str, Any]] = {}
-
-    if not os.path.exists(path):
-        return rows, index
-
-    with open(path, newline="", encoding="utf-8") as f:
-        r = csv.DictReader(f)
-        for row in r:
-            if not isinstance(row, dict):
-                continue
-            name = row.get("name") or row.get("player") or row.get("Player") or ""
-            team = row.get("team") or row.get("Team") or row.get("tm") or ""
-            pos  = row.get("pos") or row.get("POS") or row.get("Pos") or ""
-            rank_s = row.get("rank_avg") or row.get("AVG") or row.get("rank") or ""
-            adp_s  = row.get("adp") or row.get("ADP") or ""
-
-            try:
-                rank = float(rank_s) if rank_s not in (None, "", "NA") else None
-            except Exception:
-                rank = None
-            try:
-                adp = float(adp_s) if adp_s not in (None, "", "NA") else None
-            except Exception:
-                adp = None
-
-            rec = {
-                "name": name,
-                "team": team,
-                "pos": pos,
-                "rank_avg": rank,
-                "adp": adp,
-                "proj_ros": None,
-            }
-            rows.append(rec)
-            if name:
-                index[norm(name)] = rec
-
+    if os.path.exists(path):
+        with open(path, newline="", encoding="utf-8") as f:
+            rdr = csv.DictReader(f)
+            for raw in rdr:
+                # lower-case keys safely
+                lower = { (k or "").strip().lower(): _s(v)
+                          for k, v in (raw.items() if raw else []) }
+                name = lower.get("name") or lower.get("player") or lower.get("player_name") or ""
+                team = lower.get("team") or lower.get("tm") or ""
+                pos  = lower.get("pos") or lower.get("position") or ""
+                rank_s = lower.get("rank_avg") or lower.get("rank") or lower.get("avg") or ""
+                adp_s  = lower.get("adp") or ""
+                try:
+                    rank = float(rank_s) if rank_s not in ("", "NA") else None
+                except:
+                    rank = None
+                try:
+                    adp = float(adp_s) if adp_s not in ("", "NA") else None
+                except:
+                    adp = None
+                if name:
+                    rec = {"name": name, "team": team, "pos": pos,
+                           "rank_avg": rank, "adp": adp, "proj_ros": None}
+                    rows.append(rec)
+                    index[norm(name)] = rec
+    # stable order
     rows.sort(key=lambda d: (math.inf if d.get("rank_avg") in (None, "") else d["rank_avg"]))
-    return rows, index
-
-def warm_rankings() -> None:
-    global _rankings_rows, _rankings_index_by_norm, _last_rankings_merge_ts
-    rows, index = _load_rankings_from_csv()
     _rankings_rows = rows
     _rankings_index_by_norm = index
     _last_rankings_merge_ts = int(time.time())
 
-# Load once on boot
+# load once on boot
 warm_rankings()
 
-# ==== models ====
+# ==== models ============================================================
 class HealthResponse(BaseModel):
     ok: bool
     players_cached: Optional[int] = None
@@ -186,6 +194,20 @@ class InspectDraftResponse(BaseModel):
     csv_top_preview: Optional[List[Dict[str, Any]]] = None
     ts: int
 
+class GuessRosterRequest(BaseModel):
+    draft_url: str
+    player_names: List[str]
+
+class GuessRosterCandidate(BaseModel):
+    roster_id: int
+    matches: int
+    players: List[str]
+
+class GuessRosterResponse(BaseModel):
+    status: str
+    draft_id: str
+    candidates: List[GuessRosterCandidate]
+
 class RecommendLiveRequest(BaseModel):
     draft_url: Optional[str] = None
     league_id: Optional[str] = None
@@ -211,83 +233,7 @@ class RecommendLiveResponse(BaseModel):
     debug_reason: List[str] = []
     ts: int
 
-# ==== utility: draft parsing ====
-
-async def _draft_id_from_url(draft_url: str) -> str:
-    # https://sleeper.com/draft/nfl/1263988228017369088
-    did = draft_url.strip().rstrip("/").split("/")[-1]
-    if not did.isdigit():
-        raise HTTPException(status_code=400, detail="Invalid draft_url")
-    return did
-
-def _names_from_picks(picks: List[Dict[str, Any]]) -> List[str]:
-    out = []
-    for p in picks or []:
-        md = p.get("metadata") if isinstance(p, dict) else None
-        name = None
-        if isinstance(md, dict):
-            name = md.get("player_name") or md.get("first_name")
-            if md.get("last_name"):
-                name = f"{name} {md['last_name']}".strip() if name else md["last_name"]
-        if not name:
-            name = p.get("player_name") or p.get("player") or p.get("name")
-        if name:
-            out.append(name)
-    return out
-
-async def _fetch_draft_bundle(draft_id: str, league_id: Optional[str]) -> Tuple[Dict[str, Any], List[Dict[str, Any]], List[str]]:
-    """Return (draft_state, picks, debug). Never raises, never returns None."""
-    debug: List[str] = []
-    draft_state: Dict[str, Any] = {"draft_id": draft_id, "league_id": league_id, "picks_made": 0}
-
-    # 1) confirm the draft object exists
-    s1, draft_obj, d1 = await _try_many([f"{SLEEPER}/draft/{draft_id}"])
-    debug += d1
-    if s1 == 200 and isinstance(draft_obj, dict):
-        draft_state["status"] = draft_obj.get("status")
-        draft_state["picks_made"] = draft_obj.get("last_picked") or 0
-        draft_state["draft_order"] = draft_obj.get("draft_order")
-
-    # 2) try picks
-    s2, picks, d2 = await _try_many([f"{SLEEPER}/draft/{draft_id}/picks"])
-    debug += d2
-    if s2 == 200 and isinstance(picks, list) and picks:
-        draft_state["picks_made"] = max(draft_state.get("picks_made", 0), len(picks))
-        return draft_state, picks, debug
-
-    # 3) fallback to board
-    s3, board, d3 = await _try_many([f"{SLEEPER}/draft/{draft_id}/board"])
-    debug += d3
-    if s3 == 200 and isinstance(board, list) and board:
-        # board is a list of picks too
-        draft_state["picks_made"] = max(draft_state.get("picks_made", 0), len(board))
-        return draft_state, board, debug
-
-    # 4) if still empty and league_id present, try re-deriving draft id then picks again
-    if league_id:
-        s4, drafts, d4 = await _try_many([f"{SLEEPER}/league/{league_id}/drafts"])
-        debug += d4
-        if s4 == 200 and isinstance(drafts, list) and drafts:
-            # take the one with matching id or just the most recent
-            ids = [d.get("draft_id") for d in drafts if isinstance(d, dict)]
-            if draft_id in ids:
-                pass  # keep draft_id
-            elif ids:
-                new_id = ids[0]
-                debug.append(f"refresh_draft_id={new_id}")
-                draft_state["draft_id"] = new_id
-                # try picks again on refreshed id
-                s5, picks2, d5 = await _try_many([f"{SLEEPER}/draft/{new_id}/picks"])
-                debug += d5
-                if s5 == 200 and isinstance(picks2, list) and picks2:
-                    draft_state["picks_made"] = max(draft_state.get("picks_made", 0), len(picks2))
-                    return draft_state, picks2, debug
-
-    # Give up gracefully
-    return draft_state, [], debug
-
-# ==== endpoints ====
-
+# ==== endpoints =========================================================
 @app.get("/health", response_model=HealthResponse)
 async def health():
     now = int(time.time())
@@ -323,31 +269,24 @@ async def echo_auth(x_api_key: Optional[str] = Header(None)):
     got_len = len(x_api_key or "")
     exp_present = bool(EXPECTED_API_KEY)
     match = (x_api_key == EXPECTED_API_KEY) if exp_present else True
-    return EchoAuthResponse(
-        ok=ok, got_present=got_present, got_len=got_len, exp_present=exp_present, match=match
-    )
+    return EchoAuthResponse(ok=ok, got_present=got_present, got_len=got_len,
+                            exp_present=exp_present, match=match)
 
 @app.post("/inspect_draft", response_model=InspectDraftResponse)
 async def inspect_draft(req: InspectDraftRequest, x_api_key: Optional[str] = Header(None)):
     require_api_key(x_api_key)
-
     input_used = req.dict(exclude_none=True)
-    draft_state = {}
-    my_team: List[Dict[str, Any]] = []
-
+    draft_state: Dict[str, Any] = {}
     picks: List[Dict[str, Any]] = []
-    debug: List[str] = []
 
     if req.draft_url:
         did = await _draft_id_from_url(req.draft_url)
-        draft_state, picks, ddbg = await _fetch_draft_bundle(did, req.league_id)
-        debug += ddbg
+        picks = await _picks_for_draft_id(did)
+        draft_state = {"draft_id": did, "league_id": None, "picks_made": len(picks)}
 
-    drafted_names = set(norm(n) for n in _names_from_picks(picks))
-    drafted_count = len(drafted_names)
-
-    csv_preview = (_rankings_rows or [])[:5]
+    my_names: List[str] = []  # keep minimal here
     now = int(time.time())
+    csv_preview = (_rankings_rows or [])[:5]
 
     return InspectDraftResponse(
         status="ok",
@@ -359,62 +298,89 @@ async def inspect_draft(req: InspectDraftRequest, x_api_key: Optional[str] = Hea
         input=input_used,
         effective_roster_id=req.roster_id,
         effective_team_slot=req.team_slot,
-        my_team=my_team,
+        my_team=[{"name": n} for n in my_names],
         drafted_count=len(picks),
-        my_team_count=len(my_team),
+        my_team_count=len(my_names),
         undrafted_count=None,
         csv_matched_count=None,
         csv_top_preview=csv_preview,
         ts=now,
     )
 
+@app.post("/guess_roster", response_model=GuessRosterResponse)
+async def guess_roster(req: GuessRosterRequest, x_api_key: Optional[str] = Header(None)):
+    require_api_key(x_api_key)
+    did = await _draft_id_from_url(req.draft_url)
+    picks = await _picks_for_draft_id(did)
+
+    want = {norm(n): n for n in (req.player_names or []) if n}
+    by_roster: Dict[int, List[str]] = {}
+    for p in picks:
+        rid = p.get("roster_id")
+        if isinstance(rid, int):
+            n = _pick_name(p)
+            if n:
+                by_roster.setdefault(rid, []).append(n)
+
+    cands: List[GuessRosterCandidate] = []
+    for rid, names in by_roster.items():
+        names_norm = {norm(n) for n in names}
+        hits = [pretty for key, pretty in want.items() if key in names_norm]
+        if hits:
+            cands.append(GuessRosterCandidate(roster_id=rid, matches=len(hits), players=hits))
+
+    # order by matches desc, then roster id
+    cands.sort(key=lambda c: (-c.matches, c.roster_id))
+    return GuessRosterResponse(status="ok", draft_id=did, candidates=cands)
+
 @app.post("/recommend_live", response_model=RecommendLiveResponse)
 async def recommend_live(req: RecommendLiveRequest, x_api_key: Optional[str] = Header(None)):
     require_api_key(x_api_key)
 
+    debug: List[str] = []
     season = req.season or 2025
     limit = max(1, min(req.limit or 10, 25))
-    debug: List[str] = []
 
     picks: List[Dict[str, Any]] = []
     draft_state: Dict[str, Any] = {"picks_made": 0}
-
     if req.draft_url:
         did = await _draft_id_from_url(req.draft_url)
-        draft_state, picks, ddbg = await _fetch_draft_bundle(did, req.league_id)
-        debug += ddbg
+        picks = await _picks_for_draft_id(did)
+        draft_state.update({"draft_id": did, "picks_made": len(picks)})
 
-    drafted_names = set(norm(n) for n in _names_from_picks(picks))
-    my_team: List[Dict[str, Any]] = []  # keep simple here
+    drafted_names = {norm(n) for n in _names_from_picks(picks)}
+    drafted_count = len(drafted_names)
+    my_team: List[Dict[str, Any]] = []  # you can fill from roster mapping later
 
-    # PRIMARY: CSV rankings filtered by undrafted
+    # PRIMARY: CSV-ranked pool excluding drafted (if we can match)
     ranked_pool = [r for r in _rankings_rows if norm(r.get("name")) not in drafted_names]
     if ranked_pool:
         debug.append(f"primary_count={len(ranked_pool)}")
+        recommended = ranked_pool[:limit]
     else:
         debug.append("primary_count=0")
+        recommended = []
 
-    recommended = ranked_pool[:limit]
-
-    # FALLBACK 1: unfiltered CSV
+    # FALLBACK 1: if primary is empty, take top CSV (ignore drafted mismatch)
     if not recommended and _rankings_rows:
         debug.append("fallback1_primary_empty")
-        recommended = [r for r in _rankings_rows if norm(r.get("name")) not in drafted_names][:limit]
+        recommended = _rankings_rows[:limit]
 
-    # FALLBACK 2: emergency list
+    # FALLBACK 2: emergency static names
     if not recommended:
         debug.append("fallback2_emergency_list")
+        rec = []
         for r in _EMERGENCY_TOP:
             if norm(r["name"]) not in drafted_names:
-                recommended.append(r)
-            if len(recommended) >= limit:
+                rec.append(r)
+            if len(rec) >= limit:
                 break
+        recommended = rec
 
-    # annotate
     pick_no = req.pick_number or draft_state.get("picks_made")
     for r in recommended:
         if "explain" not in r:
-            r["explain"] = f"rank={r.get('rank_avg')}, pick {pick_no}"
+            r["explain"] = f"rank={r.get('rank_avg')}, pick {pick_no if pick_no is not None else 'NA'}"
 
     now = int(time.time())
     return RecommendLiveResponse(
@@ -426,7 +392,7 @@ async def recommend_live(req: RecommendLiveRequest, x_api_key: Optional[str] = H
         my_team=my_team,
         draft_state=draft_state,
         effective_roster_id=req.roster_id,
-        drafted_count=len(drafted_names),
+        drafted_count=drafted_count,
         my_team_count=len(my_team),
         debug_reason=debug,
         ts=now,
